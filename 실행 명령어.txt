@@ -1,0 +1,8 @@
+[train]
+python train_model.py -d "C:\Users\hamsa\OneDrive\바탕 화면\Physionet\outputs" -m "C:\Users\hamsa\OneDrive\바탕 화면\Physionet\model" -v
+
+[run]
+python run_model.py -d "C:\Users\hamsa\OneDrive\바탕 화면\Physionet\outputs" -m "C:\Users\hamsa\OneDrive\바탕 화면\Physionet\model" -o "C:\Users\hamsa\OneDrive\바탕 화면\Physionet\predictions" -v
+
+[evaluate]
+python evaluate_model.py -d "C:\Users\hamsa\OneDrive\바탕 화면\Physionet\outputs" -o "C:\Users\hamsa\OneDrive\바탕 화면\Physionet\predictions" -s "C:\Users\hamsa\OneDrive\바탕 화면\Physionet\scores.csv"
