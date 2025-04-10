@@ -1,15 +1,31 @@
 #!/usr/bin/env python
 
+"""
+team_code.py
+
+본 파일은 ECG 데이터를 기반으로 한 Chagas 질환 예측 모델 학습 및 추론을 위한 팀 코드입니다.
+아래 기능을 포함합니다:
+  - 데이터 전처리 및 피처 추출 (기본 통계 및 추가 피처: QRS duration 등)
+  - 데이터 분할 (학습/평가 데이터를 stratify하여 분리)
+  - RandomForestClassifier 기반 모델 학습 (하이퍼파라미터는 환경 변수로 설정)
+  - 학습된 모델 저장 및 추론 기능
+
+피처 추출 부분은 joblib.Parallel을 활용하여 병렬 처리하였으며,
+QRS duration 계산은 Pan-Tompkins 알고리즘을 사용하고, numba를 통해 최적화하였습니다.
+"""
+
 import os
 import joblib
 import numpy as np
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
+from joblib import Parallel, delayed
 import sys
+from numba import jit
 
 from helper_code import *
 
-# 환경 변수값 불러오기기
+# 환경 변수값 불러오기 (설정 파일이나 환경 변수로 쉽게 조정 가능)
 N_ESTIMATORS    = int(os.getenv("N_ESTIMATORS", "12"))
 MAX_LEAF_NODES  = int(os.getenv("MAX_LEAF_NODES", "34"))
 RANDOM_STATE    = int(os.getenv("RANDOM_STATE", "56"))
@@ -17,37 +33,38 @@ FS_DEFAULT      = float(os.getenv("FS_DEFAULT", "400"))
 BANDPASS_LOWCUT = float(os.getenv("BANDPASS_LOWCUT", "0.5"))
 BANDPASS_HIGHCUT= float(os.getenv("BANDPASS_HIGHCUT", "40.0"))
 BANDPASS_ORDER  = int(os.getenv("BANDPASS_ORDER", "3"))
-THRESHOLD_RATIO = float(os.getenv("THRESHOLD_RATIO", "0.1"))
+# Pan-Tompkins 임계값 계수; 일반적으로 0.5 정도가 사용됨
+THRESHOLD_FACTOR = float(os.getenv("THRESHOLD_FACTOR", "0.5"))
 V1_INDEX        = int(os.getenv("V1_INDEX", "6"))
 V2_INDEX        = int(os.getenv("V2_INDEX", "7"))
 
+# =============================================================================
+# Required functions: train_model, load_model, run_model
+# =============================================================================
 
 def train_model(data_folder, model_folder, verbose):
- 
     if verbose:
         print('데이터 파일 찾는 중...')
     records = find_records(data_folder)
     num_records = len(records)
     if num_records == 0:
         raise FileNotFoundError('데이터가 제공되지 않았습니다.')
-
+    
     if verbose:
         print('피처와 라벨 추출 중...')
-    # 전체 피처 차원: age (1) + 성별 one-hot (3) + 통계/주파수 기반 피처 (11) + QRS duration (1) = 17
-    features = np.zeros((num_records, 17), dtype=np.float64)
-    labels = np.zeros(num_records, dtype=bool)
 
-    for i in range(num_records):
-        if verbose:
-            width = len(str(num_records))
-            print(f'- {i+1:>{width}}/{num_records}: {records[i]}...')
-        record_path = os.path.join(data_folder, records[i])
-        features[i] = extract_features(record_path)
-        labels[i] = load_label(record_path)
-    
-    # 학습 데이터와 평가 데이터를 분할 (라벨 분포를 유지)
+    features_list = Parallel(n_jobs=-1)(
+        delayed(extract_features)(os.path.join(data_folder, rec)) for rec in records
+    )
+    labels_list = Parallel(n_jobs=-1)(
+        delayed(load_label)(os.path.join(data_folder, rec)) for rec in records
+    )
+    features = np.vstack(features_list)
+    labels = np.array(labels_list, dtype=bool)
+
     X_train, X_val, y_train, y_val = train_test_split(
-        features, labels, test_size=0.2, random_state=RANDOM_STATE, stratify=labels)
+        features, labels, test_size=0.2, random_state=RANDOM_STATE, stratify=labels
+    )
     if verbose:
         print(f'학습 데이터 샘플 수: {X_train.shape[0]}, 평가 데이터 샘플 수: {X_val.shape[0]}')
     
@@ -60,7 +77,6 @@ def train_model(data_folder, model_folder, verbose):
         class_weight="balanced"
     ).fit(X_train, y_train)
     
-   
     y_pred = model.predict(X_val)
     accuracy = (y_pred == y_val).mean()
     if verbose:
@@ -80,7 +96,6 @@ def load_model(model_folder, verbose):
 
 
 def run_model(record, model, verbose):
-  
     model = model['model']
     features = extract_features(record)
     features = features.reshape(1, -1)
@@ -89,7 +104,9 @@ def run_model(record, model, verbose):
     return binary_output, probability
 
 
-# 피처 추출
+# =============================================================================
+# Optional functions: 피처 추출 관련 기능
+# =============================================================================
 
 from scipy.signal import butter, filtfilt
 
@@ -101,28 +118,64 @@ def bandpass_filter(signal, lowcut, highcut, fs, order):
     filtered_signal = filtfilt(b, a, signal, axis=0)
     return filtered_signal
 
-
-def compute_qrs_duration(ecg, fs, threshold_ratio):
+@jit(nopython=True)
+def compute_qrs_duration_pantompkins(ecg, fs, threshold_factor):
     """
-    R-peak를 기준으로 신호의 절대값이 최대값의 일정 비율(threshold_ratio) 이하가 되는 지점.
+    Pan-Tompkins 알고리즘을 활용하여 단일 1차원 ECG 신호의 QRS duration (초)을 계산합니다.
+    단계:
+      1. 미분 (연속 차분)
+      2. 제곱
+      3. 이동 창 적분 (창 크기: 150ms)
+      4. 통합 신호에서 R-peak 검출 및 threshold_factor를 이용하여 QRS onset/offset 찾기
+    최적화를 위해 numba의 JIT 컴파일을 적용합니다.
     """
-    if len(ecg) == 0:
-        return 0.0
-    idx = np.argmax(np.abs(ecg))
-    R_val = np.abs(ecg[idx])
-    threshold = R_val * threshold_ratio
-    left = idx
-    while left > 0 and np.abs(ecg[left]) > threshold:
-        left -= 1
-    right = idx
-    while right < len(ecg) - 1 and np.abs(ecg[right]) > threshold:
-        right += 1
-    duration_samples = right - left
+    n = len(ecg)
+    # 1. 미분
+    diff_ecg = np.empty(n)
+    diff_ecg[0] = 0.0
+    for i in range(1, n):
+        diff_ecg[i] = ecg[i] - ecg[i-1]
+    # 2. 제곱
+    squared = diff_ecg * diff_ecg
+    # 3. 이동 창 적분: 창 크기 = 150ms
+    window_size = int(0.150 * fs)
+    integrated = np.empty(n)
+    half_window = window_size // 2
+    for i in range(n):
+        start = i - half_window if i - half_window > 0 else 0
+        end = i + half_window if i + half_window < n else n
+        s = 0.0
+        for j in range(start, end):
+            s += squared[j]
+        integrated[i] = s / (end - start)
+    # 4. R-peak 검출: 통합 신호의 최대값 위치
+    r_index = 0
+    max_val = integrated[0]
+    for i in range(1, n):
+        if integrated[i] > max_val:
+            max_val = integrated[i]
+            r_index = i
+    # 임계값 설정 (threshold_factor * max값)
+    threshold = threshold_factor * max_val
+    # QRS onset: r_index에서 왼쪽으로, threshold 아래가 될 때까지 이동
+    onset = r_index
+    while onset > 0 and integrated[onset] > threshold:
+        onset -= 1
+    # QRS offset: r_index에서 오른쪽으로, threshold 아래가 될 때까지 이동
+    offset = r_index
+    while offset < n - 1 and integrated[offset] > threshold:
+        offset += 1
+    duration_samples = offset - onset
     duration_seconds = duration_samples / fs
     return duration_seconds
 
-
 def extract_features(record):
+    """
+    주어진 ECG 기록에서 다음 피처들을 추출하여 17차원 feature vector를 구성합니다.
+      - 나이, 성별(one-hot 인코딩)
+      - 신호의 평균, 표준편차, 최대, 최소, 범위, 중앙값, IQR, 에너지, 제로 크로싱 수,
+        왜도, 첨도, FFT를 통한 dominant frequency, QRS duration (리드 V1, V2의 평균)
+    """
     header = load_header(record)
     age = get_age(header)
     sex = get_sex(header)
@@ -136,7 +189,6 @@ def extract_features(record):
     
     signal, fields = load_signals(record)
     fs = fields.get("fs", FS_DEFAULT)
-    # 밴드패스 필터 적용 (lowcut, highcut, order 사용)
     filtered_signal = bandpass_filter(signal, BANDPASS_LOWCUT, BANDPASS_HIGHCUT, fs, BANDPASS_ORDER)
     
     flat_signal = signal.flatten()
@@ -164,18 +216,14 @@ def extract_features(record):
     fft_magnitudes = np.abs(fft_values)
     dominant_frequency = np.argmax(fft_magnitudes)
     
-    # QRS duration 계산: 환경 변수로 지정한 V1_INDEX, V2_INDEX를 사용
+    # QRS duration 계산: 환경 변수로 지정한 V1_INDEX, V2_INDEX를 사용하여 Pan-Tompkins 알고리즘 적용
     if signal.shape[1] > max(V1_INDEX, V2_INDEX):
-        qrs_v1 = compute_qrs_duration(signal[:, V1_INDEX], fs, THRESHOLD_RATIO)
-        qrs_v2 = compute_qrs_duration(signal[:, V2_INDEX], fs, THRESHOLD_RATIO)
+        qrs_v1 = compute_qrs_duration_pantompkins(signal[:, V1_INDEX], fs, THRESHOLD_FACTOR)
+        qrs_v2 = compute_qrs_duration_pantompkins(signal[:, V2_INDEX], fs, THRESHOLD_FACTOR)
         qrs_duration = (qrs_v1 + qrs_v2) / 2
     else:
         qrs_duration = 0.0
 
-    # 피처 벡터 구성:
-    # 순서: age, one_hot_encoding_sex (3), signal_mean, signal_std, signal_max, signal_min,
-    # signal_range, signal_median, IQR, energy, zero_crossings, signal_skew, signal_kurt,
-    # dominant_frequency, qrs_duration
     features = np.concatenate((
         [age],
         one_hot_encoding_sex,
