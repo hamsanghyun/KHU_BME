@@ -4,4 +4,5 @@ scikit-learn==1.6.1
 scipy==1.15.2
 wfdb==4.2.0
 joblib==1.4.2
+numba==0.61.2
 imbalanced-learn==0.13.0
