@@ -1,211 +1,240 @@
-#!/usr/bin/env python
-
-import os
 import joblib
 import numpy as np
+import os
+from xgboost import XGBClassifier
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import train_test_split
-from joblib import Parallel, delayed
-import sys
-from numba import jit
-
+from imblearn.over_sampling import SMOTE
+from sklearn.preprocessing import StandardScaler
 from helper_code import *
+from scipy.signal import butter, filtfilt, find_peaks, spectrogram, peak_widths
+from scipy.stats import entropy, skew, kurtosis
+import pywt
+import warnings
 
-# 환경 변수값 불러오기
-N_ESTIMATORS    = int(os.getenv("N_ESTIMATORS", "12"))
-MAX_LEAF_NODES  = int(os.getenv("MAX_LEAF_NODES", "34"))
-RANDOM_STATE    = int(os.getenv("RANDOM_STATE", "56"))
-FS_DEFAULT      = float(os.getenv("FS_DEFAULT", "400"))
-BANDPASS_LOWCUT = float(os.getenv("BANDPASS_LOWCUT", "0.5"))
-BANDPASS_HIGHCUT= float(os.getenv("BANDPASS_HIGHCUT", "40.0"))
-BANDPASS_ORDER  = int(os.getenv("BANDPASS_ORDER", "3"))
-# Pan-Tompkins 임계값 계수; 일반적으로 0.5
-THRESHOLD_FACTOR = float(os.getenv("THRESHOLD_FACTOR", "0.5"))
-V1_INDEX        = int(os.getenv("V1_INDEX", "6"))
-V2_INDEX        = int(os.getenv("V2_INDEX", "7"))
+def optimize_threshold(probas, labels):
+    best_thresh, best_score = 0.5, 0
+    thresholds = np.linspace(0.01, 0.5, 200)
+    for t in thresholds:
+        outputs = probas * (probas >= t)
+        score = compute_challenge_score(labels, outputs)
+        if score > best_score:
+            best_thresh, best_score = t, score
+    return best_thresh
 
+def save_model(model_folder, model):
+    joblib.dump(model, os.path.join(model_folder, 'model_ensemble.sav'), protocol=0)
+
+def load_model(model_folder, verbose):
+    return joblib.load(os.path.join(model_folder, 'model_ensemble.sav'))
 
 def train_model(data_folder, model_folder, verbose):
     if verbose:
-        print('데이터 파일 찾는 중...')
+        print('Finding the Challenge data...')
     records = find_records(data_folder)
-    num_records = len(records)
-    if num_records == 0:
-        raise FileNotFoundError('데이터가 제공되지 않았습니다.')
-    
-    if verbose:
-        print('피처와 라벨 추출 중...')
+    if len(records) == 0:
+        raise FileNotFoundError('No data found.')
 
-    features_list = Parallel(n_jobs=-1)(
-        delayed(extract_features)(os.path.join(data_folder, rec)) for rec in records
-    )
-    labels_list = Parallel(n_jobs=-1)(
-        delayed(load_label)(os.path.join(data_folder, rec)) for rec in records
-    )
+    features_list, labels = [], []
+    for i, rec in enumerate(records):
+        if verbose:
+            print(f'- {i+1}/{len(records)}: {rec}...')
+        record_path = os.path.join(data_folder, rec)
+        feat = extract_features(record_path)
+        if np.all(np.isfinite(feat)):
+            features_list.append(feat)
+            labels.append(load_label(record_path))
+
     features = np.vstack(features_list)
-    labels = np.array(labels_list, dtype=bool)
+    labels = np.array(labels)
 
-    X_train, X_val, y_train, y_val = train_test_split(
-        features, labels, test_size=0.2, random_state=RANDOM_STATE, stratify=labels
+    scaler = StandardScaler()
+    features = scaler.fit_transform(features)
+
+    smote = SMOTE()
+    features_res, labels_res = smote.fit_resample(features, labels)
+
+    pos = (labels == 1).sum()
+    neg = (labels == 0).sum()
+    scale_pos_weight = neg / pos if pos > 0 else 1
+
+    xgb = XGBClassifier(
+        n_estimators=200, max_depth=6, learning_rate=0.05,
+        use_label_encoder=False, eval_metric='logloss',
+        scale_pos_weight=scale_pos_weight,
+        max_delta_step=1, subsample=0.8, colsample_bytree=0.8
     )
-    if verbose:
-        print(f'학습 데이터 샘플 수: {X_train.shape[0]}, 평가 데이터 샘플 수: {X_val.shape[0]}')
-    
-    if verbose:
-        print('모델 학습 중...')
-    model = RandomForestClassifier(
-        n_estimators=N_ESTIMATORS,
-        max_leaf_nodes=MAX_LEAF_NODES,
-        random_state=RANDOM_STATE,
-        class_weight="balanced"
-    ).fit(X_train, y_train)
-    
-    y_pred = model.predict(X_val)
-    accuracy = (y_pred == y_val).mean()
-    if verbose:
-        print(f'평가 데이터 정확도: {accuracy:.3f}')
-    
+    xgb.fit(features_res, labels_res)
+
+    rf = RandomForestClassifier(
+        n_estimators=300, max_depth=8,
+        class_weight='balanced', n_jobs=-1,
+        random_state=42
+    )
+    rf.fit(features_res, labels_res)
+
+    probas_xgb = xgb.predict_proba(features)[:, 1]
+    probas_rf = rf.predict_proba(features)[:, 1]
+    probas_ensemble = (probas_xgb + probas_rf) / 2
+
+    threshold = optimize_threshold(probas_ensemble, labels)
+
     os.makedirs(model_folder, exist_ok=True)
-    save_model(model_folder, model)
-    
+    save_model(model_folder, {
+        'xgb': xgb,
+        'rf': rf,
+        'threshold': threshold,
+        'scaler': scaler
+    })
+
     if verbose:
-        print('학습 완료.\n')
-
-
-def load_model(model_folder, verbose):
-    model_filename = os.path.join(model_folder, 'model.sav')
-    model = joblib.load(model_filename)
-    return model
-
+        print(f'Training done. Best threshold: {threshold:.3f}')
 
 def run_model(record, model, verbose):
-    model = model['model']
-    features = extract_features(record)
-    features = features.reshape(1, -1)
-    probability = model.predict_proba(features)[0][1]
-    binary_output = int(probability > 0.3)
-    return binary_output, probability
-
-
-# =============================================================================
-# Optional functions: 피처 추출 관련 기능
-# =============================================================================
-
-from scipy.signal import butter, filtfilt
-
-def bandpass_filter(signal, lowcut, highcut, fs, order):
-    nyq = 0.5 * fs
-    low = lowcut / nyq
-    high = highcut / nyq
-    b, a = butter(order, [low, high], btype='band')
-    filtered_signal = filtfilt(b, a, signal, axis=0)
-    return filtered_signal
-
-@jit(nopython=True)
-def compute_qrs_duration_pantompkins(ecg, fs, threshold_factor):
-    
-    n = len(ecg)
-    # 1. 미분
-    diff_ecg = np.empty(n)
-    diff_ecg[0] = 0.0
-    for i in range(1, n):
-        diff_ecg[i] = ecg[i] - ecg[i-1]
-    # 2. 제곱
-    squared = diff_ecg * diff_ecg
-    # 3. 이동 창 적분: 창 크기 = 150ms
-    window_size = int(0.150 * fs)
-    integrated = np.empty(n)
-    half_window = window_size // 2
-    for i in range(n):
-        start = i - half_window if i - half_window > 0 else 0
-        end = i + half_window if i + half_window < n else n
-        s = 0.0
-        for j in range(start, end):
-            s += squared[j]
-        integrated[i] = s / (end - start)
-    # 4. R-peak 검출: 통합 신호의 최대값 위치
-    r_index = 0
-    max_val = integrated[0]
-    for i in range(1, n):
-        if integrated[i] > max_val:
-            max_val = integrated[i]
-            r_index = i
-    # 임계값 설정 (threshold_factor * max값)
-    threshold = threshold_factor * max_val
-    # QRS onset: r_index에서 왼쪽으로, threshold 아래가 될 때까지 이동
-    onset = r_index
-    while onset > 0 and integrated[onset] > threshold:
-        onset -= 1
-    # QRS offset: r_index에서 오른쪽으로, threshold 아래가 될 때까지 이동
-    offset = r_index
-    while offset < n - 1 and integrated[offset] > threshold:
-        offset += 1
-    duration_samples = offset - onset
-    duration_seconds = duration_samples / fs
-    return duration_seconds
+    features = extract_features(record).reshape(1, -1)
+    features = model['scaler'].transform(features)
+    proba_xgb = model['xgb'].predict_proba(features)[0][1]
+    proba_rf = model['rf'].predict_proba(features)[0][1]
+    proba = (proba_xgb + proba_rf) / 2
+    return int(proba >= model['threshold']), proba
 
 def extract_features(record):
-    
     header = load_header(record)
-    age = get_age(header)
-    sex = get_sex(header)
-    one_hot_encoding_sex = np.zeros(3, dtype=np.float32)
-    if sex == 'Female':
-        one_hot_encoding_sex[0] = 1.0
-    elif sex == 'Male':
-        one_hot_encoding_sex[1] = 1.0
-    else:
-        one_hot_encoding_sex[2] = 1.0
-    
     signal, fields = load_signals(record)
-    fs = fields.get("fs", FS_DEFAULT)
-    filtered_signal = bandpass_filter(signal, BANDPASS_LOWCUT, BANDPASS_HIGHCUT, fs, BANDPASS_ORDER)
-    
-    flat_signal = signal.flatten()
-    if np.sum(np.isfinite(flat_signal)) > 0:
-        signal_mean = np.nanmean(flat_signal)
-        signal_std = np.nanstd(flat_signal)
-        signal_max = np.nanmax(flat_signal)
-        signal_min = np.nanmin(flat_signal)
-    else:
-        signal_mean = signal_std = signal_max = signal_min = 0.0
+    fs = fields['fs']
+    leads = get_signal_names(header)
+    lead_map = {name: i for i, name in enumerate(leads)}
+    def lead(name): return signal[:, lead_map.get(name, 0)]
 
-    signal_range = signal_max - signal_min
-    signal_median = np.nanmedian(flat_signal)
-    Q1 = np.percentile(flat_signal, 25)
-    Q3 = np.percentile(flat_signal, 75)
-    IQR = Q3 - Q1
-    energy = np.sum(flat_signal ** 2) / len(flat_signal) if len(flat_signal) > 0 else 0.0
-    zero_crossings = np.sum(np.diff(np.sign(flat_signal)) != 0)
-    
-    from scipy.stats import skew, kurtosis
-    signal_skew = skew(flat_signal)
-    signal_kurt = kurtosis(flat_signal)
-    
-    fft_values = np.fft.rfft(flat_signal)
-    fft_magnitudes = np.abs(fft_values)
-    dominant_frequency = np.argmax(fft_magnitudes)
-    
-    # QRS duration 계산: 환경 변수로 지정한 V1_INDEX, V2_INDEX를 사용하여 Pan-Tompkins 알고리즘 적용
-    if signal.shape[1] > max(V1_INDEX, V2_INDEX):
-        qrs_v1 = compute_qrs_duration_pantompkins(signal[:, V1_INDEX], fs, THRESHOLD_FACTOR)
-        qrs_v2 = compute_qrs_duration_pantompkins(signal[:, V2_INDEX], fs, THRESHOLD_FACTOR)
-        qrs_duration = (qrs_v1 + qrs_v2) / 2
-    else:
-        qrs_duration = 0.0
+    def bandpass(data, low=0.5, high=40):
+        nyq = 0.5 * fs
+        b, a = butter(2, [low/nyq, high/nyq], btype='band')
+        return filtfilt(b, a, data - np.mean(data))
 
-    features = np.concatenate((
-        [age],
-        one_hot_encoding_sex,
-        [signal_mean, signal_std, signal_max, signal_min,
-         signal_range, signal_median, IQR, energy, zero_crossings,
-         signal_skew, signal_kurt, dominant_frequency, qrs_duration]
-    ))
-    
-    return np.asarray(features, dtype=np.float32)
+    preprocessed = {name: bandpass(lead(name)) for name in ['V1','V2','V3','V4','V6','II','I']}
+    v1, v2, v3, v4, v6, ii, i_lead = [preprocessed[name] for name in ['V1','V2','V3','V4','V6','II','I']]
 
+    def pan_tompkins(ecg):
+        d = np.diff(ecg)
+        s = d ** 2
+        i = np.convolve(s, np.ones(int(0.15*fs))/int(0.15*fs), mode='same')
+        threshold = 0.5 * np.max(i)
+        peaks, _ = find_peaks(i, height=threshold, distance=int(0.2*fs))
+        return peaks
 
-def save_model(model_folder, model):
-    d = {'model': model}
-    filename = os.path.join(model_folder, 'model.sav')
-    joblib.dump(d, filename, protocol=0)
+    peaks = pan_tompkins(v2)
+    rr = np.diff(peaks) / fs if len(peaks) > 1 else []
+    hr = 60 / np.nanmean(rr) if len(rr) > 0 else 0
+    rr_std = np.nanstd(rr) if len(rr) > 1 else 0
+    rr_skew = skew(rr) if len(rr) > 2 else 0
+    rr_kurt = kurtosis(rr) if len(rr) > 3 else 0
+
+    qrs_dur, qt, tamp, q_dur, qrs_area = 0, 0, 0, 0, 0
+    st_duration, st_slope, pr_interval, t_symmetry = 0, 0, 0, 0
+
+    for p in peaks:
+        right = min(p + int(0.4 * fs), len(v3))
+        seg = v3[p:right]
+        tpk, _ = find_peaks(seg, height=np.percentile(seg, 85))
+        qt += (tpk[-1]/fs)*1000 if len(tpk) else 0
+
+        seg2 = v4[p:right]
+        base = np.median(v4[p-50:p]) if p >= 50 else 0
+        tpk2, _ = find_peaks(seg2, height=np.percentile(seg2, 85))
+        if len(tpk2):
+            tamp += seg2[tpk2[-1]] - base
+            half = len(tpk2) // 2
+            left_amp = np.mean(seg2[tpk2[:half]]) if half > 0 else 0
+            right_amp = np.mean(seg2[tpk2[half:]]) if half > 0 else 0
+            t_symmetry += abs(left_amp - right_amp)
+
+        seg_q = ii[max(p - int(0.25 * fs), 0):p]
+        neg = np.where(seg_q < 0)[0]
+        q_dur += (neg[-1] - neg[0]) / fs * 1000 if len(neg) > 1 else 0
+
+        qrs_area += np.abs(v2[p]) if p < len(v2) else 0
+
+        st_seg = v2[p + int(0.04*fs): p + int(0.08*fs)]
+        st_duration += len(st_seg) / fs * 1000 if len(st_seg) else 0
+        if len(st_seg) > 1:
+            st_slope += (st_seg[-1] - st_seg[0]) / (len(st_seg) / fs)
+
+        pr_start = max(p - int(0.2*fs), 0)
+        pr_peak, _ = find_peaks(ii[pr_start:p], distance=5)
+        if len(pr_peak):
+            pr_interval += (p - (pr_start + pr_peak[-1])) / fs * 1000
+
+    n_peaks = len(peaks) if len(peaks) else 1
+    qt /= n_peaks; tamp /= n_peaks; q_dur /= n_peaks; qrs_area /= n_peaks
+    st_duration /= n_peaks; st_slope /= n_peaks; pr_interval /= n_peaks; t_symmetry /= n_peaks
+
+    qrs_dur = np.mean(peak_widths(v2, peaks, rel_height=0.5)[0])/fs*1000 if len(peaks) > 1 else 0
+    qrs_dur = qrs_dur if np.isfinite(qrs_dur) else 0
+
+    zcr = np.sum(np.diff(np.sign(v2)) != 0) / len(v2)
+
+    def get_spectral(x):
+        seg_len = min(len(x), 256)
+        overlap = min(128, seg_len // 2)
+        f, _, Sxx = spectrogram(x, fs=fs, nperseg=seg_len, noverlap=overlap)
+        mask = f <= 40
+        f, Sxx = f[mask], Sxx[mask]
+        power = np.nan_to_num(np.mean(Sxx, axis=1))
+        total = np.sum(power)
+        lf = np.sum(power[(f >= 0) & (f < 15)])
+        hf = np.sum(power[(f >= 15)])
+        centroid = np.sum(f * power) / total if total else 0
+        flatness = entropy(power / total) if total else 0
+        return lf / hf if hf else 0, centroid, flatness
+
+    def wavelet_entropy_vector(x):
+        coeffs = pywt.wavedec(x, 'db4', level=4)
+        energy = np.array([np.sum(c ** 2) for c in coeffs])
+        norm_energy = energy / np.sum(energy) if np.sum(energy) > 0 else np.ones_like(energy)/len(energy)
+        return norm_energy
+
+    def cwt_features(x):
+        cwt_matrix, _ = pywt.cwt(x, np.arange(1, 31), 'morl', sampling_period=1/fs)
+        power = np.abs(cwt_matrix) ** 2
+        return np.sum(power), np.mean(power), np.max(power)
+
+    rsr_v1 = np.sum(np.diff(np.sign(np.diff(v1))) != 0)
+    rsr_v2 = np.sum(np.diff(np.sign(np.diff(v2))) != 0)
+    corr_iv2 = np.corrcoef(i_lead, v2)[0, 1] if np.std(i_lead) > 0 and np.std(v2) > 0 else 0
+
+    e2 = np.nansum(v2 ** 2)
+    v2_var = np.nanvar(v2)
+
+    lf1, c1, f1 = get_spectral(i_lead)
+    lf2, c2, f2 = get_spectral(ii)
+    lf6, c6, f6 = get_spectral(v6)
+
+    we_v2_vec = wavelet_entropy_vector(v2)
+    we_i_vec = wavelet_entropy_vector(i_lead)
+    cwt_sum, cwt_mean, cwt_max = cwt_features(v2)
+
+    centroids, flatnesses = [], []
+    for i in range(signal.shape[1]):
+        _, c, f = get_spectral(signal[:, i])
+        centroids.append(c)
+        flatnesses.append(f)
+
+    # Derived ratios
+    qt_ratio = qt / qrs_dur if qrs_dur else 0
+    q_dur_ratio = q_dur / qrs_dur if qrs_dur else 0
+    qrs_area_ratio = qrs_area / (np.abs(v1).sum() / len(v1)) if len(v1) else 0
+
+    return np.nan_to_num(np.array([
+        hr, qrs_dur,
+        lf1, lf2, lf6,
+        rsr_v1, rsr_v2,
+        *we_v2_vec, *we_i_vec,
+        qt, tamp, q_dur,
+        qrs_area,
+        e2, v2_var, zcr, corr_iv2,
+        rr_std, rr_skew, rr_kurt,
+        cwt_sum, cwt_mean, cwt_max,
+        st_duration, st_slope,
+        pr_interval, t_symmetry,
+        qt_ratio, q_dur_ratio, qrs_area_ratio,
+        *centroids, *flatnesses
+    ], dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
