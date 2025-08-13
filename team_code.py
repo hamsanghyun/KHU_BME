@@ -6,7 +6,7 @@ from sklearn.ensemble import RandomForestClassifier
 from imblearn.over_sampling import SMOTE
 from sklearn.preprocessing import StandardScaler
 from helper_code import *
-from scipy.signal import butter, filtfilt, find_peaks, spectrogram, peak_widths
+from scipy.signal import butter, lfilter, find_peaks, spectrogram, peak_widths
 from scipy.stats import entropy, skew, kurtosis
 import pywt
 import warnings
@@ -105,136 +105,220 @@ def extract_features(record):
     lead_map = {name: i for i, name in enumerate(leads)}
     def lead(name): return signal[:, lead_map.get(name, 0)]
 
-    def bandpass(data, low=0.5, high=40):
+    def bandpass_filter(data, lowcut=0.5, highcut=40.0):
         nyq = 0.5 * fs
-        b, a = butter(2, [low/nyq, high/nyq], btype='band')
-        return filtfilt(b, a, data - np.mean(data))
+        b, a = butter(1, [lowcut / nyq, highcut / nyq], btype='band')
+        return lfilter(b, a, data)
 
-    preprocessed = {name: bandpass(lead(name)) for name in ['V1','V2','V3','V4','V6','II','I']}
-    v1, v2, v3, v4, v6, ii, i_lead = [preprocessed[name] for name in ['V1','V2','V3','V4','V6','II','I']]
-
-    def pan_tompkins(ecg):
-        d = np.diff(ecg)
+    def pan_tompkins_qrs(ecg):
+        f = bandpass_filter(ecg)
+        d = np.diff(f)
+        if d.size == 0:
+            return np.array([], dtype=int)
         s = d ** 2
-        i = np.convolve(s, np.ones(int(0.15*fs))/int(0.15*fs), mode='same')
-        threshold = 0.5 * np.max(i)
-        peaks, _ = find_peaks(i, height=threshold, distance=int(0.2*fs))
-        return peaks
+        w = max(1, int(0.150 * fs))
+        i = np.convolve(s, np.ones(w)/w, mode='same')
+        init_len = min(len(i), int(2 * fs))
+        initial_seg = i[:init_len] if init_len > 0 else i
+        if initial_seg.size == 0:
+            return np.array([], dtype=int)
+        SignalLevel = 0.25 * np.max(initial_seg)
+        NoiseLevel = 0.5 * np.mean(initial_seg)
+        Threshold_coefficient = 0.25
 
-    peaks = pan_tompkins(v2)
-    rr = np.diff(peaks) / fs if len(peaks) > 1 else []
-    hr = 60 / np.nanmean(rr) if len(rr) > 0 else 0
-    rr_std = np.nanstd(rr) if len(rr) > 1 else 0
-    rr_skew = skew(rr) if len(rr) > 2 else 0
-    rr_kurt = kurtosis(rr) if len(rr) > 3 else 0
+        peaks = []
+        last_peak = -np.inf
+        min_rr = int(0.20 * fs)
 
-    qrs_dur, qt, tamp, q_dur, qrs_area = 0, 0, 0, 0, 0
-    st_duration, st_slope, pr_interval, t_symmetry = 0, 0, 0, 0
+        for n, val in enumerate(i):
+            threshold = NoiseLevel + Threshold_coefficient * (SignalLevel - NoiseLevel)
+            if val > threshold and (n - last_peak) > min_rr:
+                left = max(n - int(0.05 * fs), 0)
+                right = min(n + int(0.05 * fs), len(f)-1)
+                if right > left and f[n] == np.max(f[left:right+1]):
+                    peaks.append(n)
+                    last_peak = n
+                    SignalLevel = 0.125 * val + 0.875 * SignalLevel
+            else:
+                NoiseLevel = 0.125 * val + 0.875 * NoiseLevel
+
+            if len(peaks) > 1:
+                rr_avg = np.mean(np.diff(peaks[-8:])) if len(peaks) >= 3 else np.diff(peaks[-2:])[0]
+                if (n - last_peak) > 1.66 * rr_avg:
+                    threshold *= 0.5
+
+        return np.asarray(peaks, dtype=int)
+
+    def safe_percentile(x, q, default=0.0):
+        x = np.asarray(x)
+        if x.size == 0 or not np.any(np.isfinite(x)):
+            return default
+        return float(np.percentile(x, q))
+
+    def get_spectral(x):
+        segment_length = min(len(x), 256)
+        if segment_length <= 1:
+            return 0.0, 0.0, 0.0
+        f, _, Sxx = spectrogram(x, fs=fs, nperseg=segment_length, noverlap=segment_length//2)
+        mask = f <= 40
+        f, Sxx = f[mask], Sxx[mask]
+        if Sxx.size == 0:
+            return 0.0, 0.0, 0.0
+        power = np.nan_to_num(np.mean(Sxx, axis=1), nan=0.0, posinf=0.0, neginf=0.0)
+        total = np.sum(power)
+        if total <= 0:
+            return 0.0, 0.0, 0.0
+        lf = np.sum(power[(f >= 0) & (f < 15)])
+        hf = np.sum(power[(f >= 15) & (f <= 40)])
+        lf_hf = float(lf / hf) if hf > 0 else 0.0
+        centroid = float(np.sum(f * power) / total)
+        flatness = float(entropy(power / total))
+        return lf_hf, centroid, flatness
+
+    def wavelet_entropy(x):
+        x = np.asarray(x)
+        if x.size < 8:
+            return 0.0
+        max_lvl = pywt.dwt_max_level(len(x), pywt.Wavelet('db4').dec_len)
+        lvl = min(4, max(1, max_lvl))
+        coeffs = pywt.wavedec(x, 'db4', level=lvl)
+        energy = np.array([np.sum(c**2) for c in coeffs], dtype=np.float64)
+        total = energy.sum()
+        if total <= 0:
+            return 0.0
+        p = energy / total
+        return float(entropy(p))
+
+    def cwt_features(x):
+        x = np.asarray(x)
+        if x.size < 8:
+            return 0.0, 0.0, 0.0
+        widths = np.arange(1, 31)
+        cwt_matrix, _ = pywt.cwt(x, widths, 'morl', sampling_period=1/fs)
+        power = np.abs(cwt_matrix) ** 2
+        return float(np.sum(power)), float(np.mean(power)), float(np.max(power))
+
+    v1, v2, v3, v4, v6, ii, i_lead = [lead(l) for l in ['V1','V2','V3','V4','V6','II','I']]
+
+    peaks = pan_tompkins_qrs(v2)
+    rr = np.diff(peaks) / fs if len(peaks) > 1 else np.array([])
+    heart_rate = float(60 / np.nanmean(rr)) if rr.size > 0 and np.nanmean(rr) > 0 else 0.0
+    rr_std = float(np.nanstd(rr)) if rr.size > 1 else 0.0
+    rr_skew = float(skew(rr)) if rr.size > 2 else 0.0
+    rr_kurt = float(kurtosis(rr)) if rr.size > 3 else 0.0
+
+    if len(peaks) > 1:
+        widths = peak_widths(v2, peaks, rel_height=0.5)[0]
+        qrs_dur = float(np.nanmean(widths) / fs * 1000.0) if widths.size else 0.0
+    else:
+        qrs_dur = 0.0
+    if not np.isfinite(qrs_dur):
+        qrs_dur = 0.0
+
+    qt, tamp, t_symmetry = 0.0, 0.0, 0.0
+    q_dur = 0.0
+    n_peaks = max(1, len(peaks))
 
     for p in peaks:
         right = min(p + int(0.4 * fs), len(v3))
-        seg = v3[p:right]
-        tpk, _ = find_peaks(seg, height=np.percentile(seg, 85))
-        qt += (tpk[-1]/fs)*1000 if len(tpk) else 0
+        if right <= p:
+            continue
 
+        # QT from V3
+        seg = v3[p:right]
+        thr = safe_percentile(seg, 85, default=(np.max(seg) * 0.85 if seg.size else 0.0))
+        t_pk, _ = find_peaks(seg, height=thr)
+        if t_pk.size:
+            qt += (t_pk[-1] / fs) * 1000.0
+
+        # T amplitude & symmetry from V4
         seg2 = v4[p:right]
-        base = np.median(v4[p-50:p]) if p >= 50 else 0
-        tpk2, _ = find_peaks(seg2, height=np.percentile(seg2, 85))
-        if len(tpk2):
-            tamp += seg2[tpk2[-1]] - base
-            half = len(tpk2) // 2
-            left_amp = np.mean(seg2[tpk2[:half]]) if half > 0 else 0
-            right_amp = np.mean(seg2[tpk2[half:]]) if half > 0 else 0
+        base_slice = v4[max(p - 50, 0):p]
+        base = float(np.median(base_slice)) if base_slice.size else 0.0
+        thr2 = safe_percentile(seg2, 85, default=(np.max(seg2) * 0.85 if seg2.size else 0.0))
+        t_pk2, _ = find_peaks(seg2, height=thr2)
+        if t_pk2.size:
+            tamp += float(seg2[t_pk2[-1]] - base)
+            half = t_pk2.size // 2
+            left_amp = float(np.mean(seg2[t_pk2[:half]])) if half > 0 else 0.0
+            right_amp = float(np.mean(seg2[t_pk2[half:]])) if half > 0 else 0.0
             t_symmetry += abs(left_amp - right_amp)
 
+        # Q-duration from lead II
         seg_q = ii[max(p - int(0.25 * fs), 0):p]
         neg = np.where(seg_q < 0)[0]
-        q_dur += (neg[-1] - neg[0]) / fs * 1000 if len(neg) > 1 else 0
+        if neg.size > 1:
+            q_dur += (neg[-1] - neg[0]) / fs * 1000.0
 
-        qrs_area += np.abs(v2[p]) if p < len(v2) else 0
+    qt /= n_peaks
+    tamp /= n_peaks
+    q_dur /= n_peaks
+    t_symmetry /= n_peaks
 
-        st_seg = v2[p + int(0.04*fs): p + int(0.08*fs)]
-        st_duration += len(st_seg) / fs * 1000 if len(st_seg) else 0
-        if len(st_seg) > 1:
-            st_slope += (st_seg[-1] - st_seg[0]) / (len(st_seg) / fs)
+    zcr = float(np.sum(np.diff(np.sign(v2)) != 0) / len(v2)) if len(v2) > 0 else 0.0
 
-        pr_start = max(p - int(0.2*fs), 0)
-        pr_peak, _ = find_peaks(ii[pr_start:p], distance=5)
-        if len(pr_peak):
-            pr_interval += (p - (pr_start + pr_peak[-1])) / fs * 1000
+    # RSR count
+    def detect_rsr_ensemble(xsig, r_peaks, fs):
+        def _bp(x):
+            b, a = butter(2, [5/(fs/2), 15/(fs/2)], btype='band')
+            return lfilter(b, a, x)
+        if r_peaks.size == 0:
+            return 0
+        f = _bp(xsig)
+        d = np.diff(f)
+        count1 = 0
+        for p in r_peaks:
+            left, right = max(p - int(0.05 * fs), 0), min(p + int(0.05 * fs), len(d))
+            seg = d[left:right]
+            zc = np.where(np.diff(np.sign(seg)))[0]
+            if zc.size >= 3:
+                a, b, c = f[left:right][zc[:3]]
+                if a > b and c > b and abs(a - c) < 0.1 * max(abs(a), abs(c)) and (max([a,b,c]) - min([a,b,c])) > 0.05:
+                    count1 += 1
+        count2 = 0
+        for i in range(1, len(r_peaks)):
+            p1, p2 = r_peaks[i - 1], r_peaks[i]
+            rr = (p2 - p1) / fs
+            if rr < 0.12 and (p2 - p1) > 2:
+                seg = xsig[p1:p2]
+                slope = np.diff(seg)
+                if slope.size > 2:
+                    sc = np.diff(np.sign(slope))
+                    z = np.where(sc != 0)[0]
+                    if any(slope[zi] < 0 and slope[zi + 1] > 0 for zi in z[:-1]):
+                        count2 += 1
+        return max(count1, count2)
 
-    n_peaks = len(peaks) if len(peaks) else 1
-    qt /= n_peaks; tamp /= n_peaks; q_dur /= n_peaks; qrs_area /= n_peaks
-    st_duration /= n_peaks; st_slope /= n_peaks; pr_interval /= n_peaks; t_symmetry /= n_peaks
+    rsr_v1 = detect_rsr_ensemble(v1, peaks, fs)
+    rsr_v2 = detect_rsr_ensemble(v2, peaks, fs)
 
-    qrs_dur = np.mean(peak_widths(v2, peaks, rel_height=0.5)[0])/fs*1000 if len(peaks) > 1 else 0
-    qrs_dur = qrs_dur if np.isfinite(qrs_dur) else 0
-
-    zcr = np.sum(np.diff(np.sign(v2)) != 0) / len(v2)
-
-    def get_spectral(x):
-        seg_len = min(len(x), 256)
-        overlap = min(128, seg_len // 2)
-        f, _, Sxx = spectrogram(x, fs=fs, nperseg=seg_len, noverlap=overlap)
-        mask = f <= 40
-        f, Sxx = f[mask], Sxx[mask]
-        power = np.nan_to_num(np.mean(Sxx, axis=1))
-        total = np.sum(power)
-        lf = np.sum(power[(f >= 0) & (f < 15)])
-        hf = np.sum(power[(f >= 15)])
-        centroid = np.sum(f * power) / total if total else 0
-        flatness = entropy(power / total) if total else 0
-        return lf / hf if hf else 0, centroid, flatness
-
-    def wavelet_entropy_vector(x):
-        coeffs = pywt.wavedec(x, 'db4', level=4)
-        energy = np.array([np.sum(c ** 2) for c in coeffs])
-        norm_energy = energy / np.sum(energy) if np.sum(energy) > 0 else np.ones_like(energy)/len(energy)
-        return norm_energy
-
-    def cwt_features(x):
-        cwt_matrix, _ = pywt.cwt(x, np.arange(1, 31), 'morl', sampling_period=1/fs)
-        power = np.abs(cwt_matrix) ** 2
-        return np.sum(power), np.mean(power), np.max(power)
-
-    rsr_v1 = np.sum(np.diff(np.sign(np.diff(v1))) != 0)
-    rsr_v2 = np.sum(np.diff(np.sign(np.diff(v2))) != 0)
-    corr_iv2 = np.corrcoef(i_lead, v2)[0, 1] if np.std(i_lead) > 0 and np.std(v2) > 0 else 0
-
-    e2 = np.nansum(v2 ** 2)
-    v2_var = np.nanvar(v2)
+    e2 = float(np.nansum(v2 ** 2))
+    v2_var = float(np.nanvar(v2))
 
     lf1, c1, f1 = get_spectral(i_lead)
     lf2, c2, f2 = get_spectral(ii)
     lf6, c6, f6 = get_spectral(v6)
 
-    we_v2_vec = wavelet_entropy_vector(v2)
-    we_i_vec = wavelet_entropy_vector(i_lead)
+    we_v2 = wavelet_entropy(v2)
+    we_i = wavelet_entropy(i_lead)
     cwt_sum, cwt_mean, cwt_max = cwt_features(v2)
 
     centroids, flatnesses = [], []
-    for i in range(signal.shape[1]):
-        _, c, f = get_spectral(signal[:, i])
+    for ch in range(signal.shape[1]):
+        _, c, f = get_spectral(signal[:, ch])
         centroids.append(c)
         flatnesses.append(f)
 
-    # Derived ratios
-    qt_ratio = qt / qrs_dur if qrs_dur else 0
-    q_dur_ratio = q_dur / qrs_dur if qrs_dur else 0
-    qrs_area_ratio = qrs_area / (np.abs(v1).sum() / len(v1)) if len(v1) else 0
-
     return np.nan_to_num(np.array([
-        hr, qrs_dur,
+        heart_rate, qrs_dur,
         lf1, lf2, lf6,
         rsr_v1, rsr_v2,
-        *we_v2_vec, *we_i_vec,
+        we_v2, we_i,
         qt, tamp, q_dur,
-        qrs_area,
-        e2, v2_var, zcr, corr_iv2,
+        e2, v2_var, zcr,
         rr_std, rr_skew, rr_kurt,
         cwt_sum, cwt_mean, cwt_max,
-        st_duration, st_slope,
-        pr_interval, t_symmetry,
-        qt_ratio, q_dur_ratio, qrs_area_ratio,
-        *centroids, *flatnesses
+        *centroids, *flatnesses,
+        t_symmetry
     ], dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+
