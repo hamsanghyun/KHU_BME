@@ -1,409 +1,683 @@
+# team_code.py
+# 저장/로드 방식:
+# - 파일명 고정: model_rf+xgb+lr.sav
+# - MANIFEST.json, LATEST.txt 관리
+# - legacy(model_xgb.sav) 역호환
+# 모델 고정: rf+xgb+lr
+# 임계값: OOF 기반 F1 최적(threshold_f1), Challenge 상위5% 컷(threshold_challenge)
+# 교차검증: StratifiedKFold(n_splits=10, shuffle=True, random_state=42)
+# payload에 fold별 점수/배열 저장(scores, oof_label, oof_proba, fold_ids)
+
 import os
-import warnings
-import numpy as np
+import json
 import joblib
-from xgboost import XGBClassifier
-from sklearn.ensemble import RandomForestClassifier
-from imblearn.over_sampling import SMOTE
-from sklearn.preprocessing import StandardScaler
+import numpy as np
+from typing import Dict, Tuple, List
+
+from helper_code import (
+    load_header, load_signals, get_signal_names, find_records, load_label,
+    compute_auc, compute_accuracy, compute_f_measure, compute_challenge_score
+)
+
 from sklearn.model_selection import StratifiedKFold
-from sklearn.isotonic import IsotonicRegression
+from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import f1_score
-from helper_code import *
-from scipy.signal import butter, filtfilt, find_peaks, peak_widths, welch
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from imblearn.over_sampling import SMOTE
+from xgboost import XGBClassifier
+
+from scipy.signal import butter, filtfilt, lfilter, welch, spectrogram, peak_widths
 from scipy.stats import entropy, skew, kurtosis
-import pywt
 
-np.random.seed(42)
+# =========================================================
+# 전역
+# =========================================================
+RNG = 42
+np.random.seed(RNG)
 
+# =========================================================
+# 저장/로드 유틸
+# =========================================================
+def _model_path(model_folder: str) -> str:
+    return os.path.join(model_folder, "model_rf+xgb+lr.sav")
 
-# ---------- Threshold search (binary metrics only) ----------
-def optimize_threshold(probas, labels):
-    best_t, best_f1 = 0.5, 0.0
-    for t in np.linspace(0.02, 0.5, 100):
-        f1 = f1_score(labels, (probas >= t).astype(int))
+def _manifest_path(model_folder: str) -> str:
+    return os.path.join(model_folder, "MANIFEST.json")
+
+def _latest_path(model_folder: str) -> str:
+    return os.path.join(model_folder, "LATEST.txt")
+
+def save_payload(model_folder: str, payload: dict):
+    os.makedirs(model_folder, exist_ok=True)
+    path = _model_path(model_folder)
+    joblib.dump(payload, path, protocol=0)
+
+    meta = {
+        "kind": "rf+xgb+lr",
+        "members": payload.get("members"),
+        "weights": payload.get("weights"),
+        "feature_dim": payload.get("feature_dim"),
+        "threshold_challenge": payload.get("threshold_challenge"),
+        "threshold_f1": payload.get("threshold_f1"),
+        "scaler": "StandardScaler",
+        "file": os.path.basename(path),
+    }
+    # MANIFEST append/update
+    manifest_fp = _manifest_path(model_folder)
+    try:
+        if os.path.exists(manifest_fp):
+            with open(manifest_fp, "r", encoding="utf-8") as f:
+                manifest = json.load(f)
+            if not isinstance(manifest, list):
+                manifest = [manifest]
+        else:
+            manifest = []
+    except Exception:
+        manifest = []
+    manifest.append(meta)
+    with open(manifest_fp, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2)
+
+    # LATEST.txt 업데이트
+    with open(_latest_path(model_folder), "w", encoding="utf-8") as f:
+        f.write(os.path.basename(path))
+
+def load_payload(model_folder: str, verbose: bool):
+    # 고정 파일 우선
+    fixed = _model_path(model_folder)
+    if os.path.exists(fixed):
+        if verbose:
+            print(f"Loading model file: {os.path.basename(fixed)}")
+        return joblib.load(fixed)
+
+    # 최신 포인터
+    latest_fp = _latest_path(model_folder)
+    if os.path.exists(latest_fp):
+        with open(latest_fp, "r", encoding="utf-8") as f:
+            latest_name = f.read().strip()
+        latest_path = os.path.join(model_folder, latest_name)
+        if os.path.exists(latest_path):
+            if verbose:
+                print(f"Loading latest model: {latest_name}")
+            return joblib.load(latest_path)
+
+    # legacy
+    legacy = os.path.join(model_folder, "model_xgb.sav")
+    if os.path.exists(legacy):
+        if verbose:
+            print("Loading legacy file: model_xgb.sav")
+        return joblib.load(legacy)
+
+    # fallback
+    for fn in sorted(os.listdir(model_folder)):
+        if fn.startswith("model_") and fn.endswith(".sav"):
+            if verbose:
+                print(f"Loading fallback: {fn}")
+            return joblib.load(os.path.join(model_folder, fn))
+
+    raise FileNotFoundError("No model file found.")
+
+# 호환 래퍼 (평가 스크립트 호환용)
+def save_model(model_folder, model, name='rf+xgb+lr'):
+    save_payload(model_folder, model)
+
+# =========================================================
+# 임계값 최적화
+# =========================================================
+def optimize_threshold_f1(probas: np.ndarray, labels: np.ndarray) -> float:
+    best_t, best_f1 = 0.5, -1.0
+    for t in np.linspace(0.01, 0.99, 197):
+        preds = (probas >= t).astype(int)
+        f1 = f1_score(labels, preds)
         if f1 > best_f1:
             best_t, best_f1 = t, f1
-    return best_t
+    return float(best_t)
 
+def optimize_threshold_top5(probas: np.ndarray) -> float:
+    n = len(probas)
+    if n == 0:
+        return 1.0
+    k = max(1, int(np.floor(0.05 * n)))
+    thr = np.partition(probas, -k)[-k]
+    return float(np.nextafter(thr, np.float64(np.inf)))
 
-# ---------- Model I/O ----------
-def save_model(model_folder, model):
-    joblib.dump(model, os.path.join(model_folder, 'model_ensemble.sav'), protocol=0)
+# =========================================================
+# 신호 처리 유틸
+# =========================================================
+def butter_bandpass(lowcut: float, highcut: float, fs: float, order: int = 2):
+    nyq = 0.5 * fs
+    b, a = butter(order, [lowcut / nyq, highcut / nyq], btype="band")
+    return b, a
 
+def bandpass_filter(x: np.ndarray, fs: float, lowcut: float = 0.5, highcut: float = 40.0, order: int = 2):
+    if x.size < 4:
+        return x
+    b, a = butter_bandpass(lowcut, highcut, fs, order=order)
+    try:
+        return filtfilt(b, a, x, method="gust")
+    except Exception:
+        return lfilter(b, a, x)
 
-def load_model(model_folder, verbose):
-    return joblib.load(os.path.join(model_folder, 'model_ensemble.sav'))
+def moving_average(x: np.ndarray, w: int) -> np.ndarray:
+    if w <= 1:
+        return x
+    k = np.ones(w, dtype=float) / w
+    return np.convolve(x, k, mode="same")
 
+# =========================================================
+# R-피크 검출
+# =========================================================
+def pan_tompkins_like(ecg: np.ndarray, fs: float) -> np.ndarray:
+    if ecg.size < int(0.5 * fs):
+        return np.array([], dtype=int)
+    f = bandpass_filter(ecg, fs, 5.0, 15.0, order=2)
+    d = np.diff(f, prepend=f[0])
+    s = d ** 2
+    w = max(1, int(0.150 * fs))
+    integ = moving_average(s, w)
 
-# ---------- Training ----------
-def train_model(data_folder, model_folder, verbose):
-    if verbose:
-        print('Finding the Challenge data...')
-    records = find_records(data_folder)
-    if len(records) == 0:
-        raise FileNotFoundError('No data were provided.')
+    init = integ[: min(len(integ), 2 * int(fs))]
+    if init.size == 0:
+        return np.array([], dtype=int)
 
-    if verbose:
-        print('Extracting features and labels...')
-    feats, labels = [], []
-    for i, rec in enumerate(records):
-        if verbose:
-            width = len(str(len(records)))
-            print(f'- {i+1:>{width}}/{len(records)}: {rec}...')
-        path = os.path.join(data_folder, rec)
-        x = extract_features(path)
-        if np.all(np.isfinite(x)):
-            feats.append(x)
-            labels.append(load_label(path))
+    signal_level = 0.25 * np.max(init)
+    noise_level = 0.5 * np.mean(init)
+    c = 0.25
+    min_rr = int(0.20 * fs)
 
-    X_raw = np.vstack(feats).astype(np.float32)
-    y = np.asarray(labels, dtype=int)
+    peaks, last = [], -10**9
+    for n, v in enumerate(integ):
+        thr = noise_level + c * (signal_level - noise_level)
+        if v > thr and (n - last) > min_rr:
+            left = max(0, n - int(0.05 * fs))
+            right = min(len(f), n + int(0.05 * fs))
+            loc = left + int(np.argmax(f[left:right]))
+            peaks.append(loc)
+            last = loc
+            signal_level = 0.125 * v + 0.875 * signal_level
+        else:
+            noise_level = 0.125 * v + 0.875 * noise_level
+    return np.asarray(peaks, dtype=int)
 
-    # Global scaler for final fit/inference
-    scaler = StandardScaler()
-    X_all = scaler.fit_transform(X_raw)
+def robust_rpeaks(multilead: Dict[str, np.ndarray], fs: float) -> np.ndarray:
+    cand = [nm for nm in ["II", "V2", "V1", "V5"] if nm in multilead]
+    if len(cand) < 2:
+        alln = list(multilead.keys())
+        alln.sort(key=lambda k: np.nanvar(multilead[k]), reverse=True)
+        cand = alln[:2]
+    peak_lists = []
+    for nm in cand:
+        p = pan_tompkins_like(multilead[nm], fs)
+        if p.size:
+            peak_lists.append(p)
+    if not peak_lists:
+        return np.array([], dtype=int)
+    all_peaks = np.concatenate(peak_lists)
+    all_peaks.sort()
+    merged = []
+    tol = int(0.06 * fs)
+    grp = [all_peaks[0]]
+    for idx in all_peaks[1:]:
+        if idx - grp[-1] <= tol:
+            grp.append(idx)
+        else:
+            merged.append(int(np.median(grp)))
+            grp = [idx]
+    merged.append(int(np.median(grp)))
+    return np.asarray(merged, dtype=int)
 
-    # ----- OOF ensemble + calibration (no leakage: fold-wise scaler/SMOTE) -----
-    if verbose:
-        print('Building OOF predictions for calibration and ensemble weighting...')
-    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-    oof_xgb = np.zeros(len(y), dtype=float)
-    oof_rf = np.zeros(len(y), dtype=float)
+# =========================================================
+# 형태학/스펙트럼/HRV 특징
+# =========================================================
+def beat_seg(signal: np.ndarray, peak: int, fs: float, pre: float = 0.20, post: float = 0.40) -> Tuple[int, int]:
+    l = max(0, peak - int(pre * fs))
+    r = min(len(signal), peak + int(post * fs))
+    return l, r
 
-    for tr, va in skf.split(X_raw, y):
-        Xtr_raw, ytr = X_raw[tr], y[tr]
-        Xva_raw = X_raw[va]
+def qrs_width_ms(x: np.ndarray, peaks: np.ndarray, fs: float) -> float:
+    if peaks.size < 1:
+        return 0.0
+    try:
+        widths, _, _, _ = peak_widths(x, peaks, rel_height=0.5)
+        return float(np.nanmean(widths) / fs * 1000.0)
+    except Exception:
+        return 0.0
 
-        scaler_cv = StandardScaler().fit(Xtr_raw)
-        Xtr = scaler_cv.transform(Xtr_raw)
-        Xva = scaler_cv.transform(Xva_raw)
+def rsr_fragmentation_count(x: np.ndarray, peaks: np.ndarray, fs: float) -> int:
+    if peaks.size == 0:
+        return 0
+    xf = bandpass_filter(x, fs, 5, 30, order=2)
+    d = np.diff(xf, prepend=xf[0])
+    cnt = 0
+    win = int(0.05 * fs)
+    for p in peaks:
+        l = max(0, p - win)
+        r = min(len(d), p + win)
+        seg = d[l:r]
+        zc = np.where(np.diff(np.sign(seg)) != 0)[0]
+        if len(zc) >= 3:
+            cnt += 1
+    return int(cnt)
 
-        Xtr_res, ytr_res = SMOTE(random_state=42).fit_resample(Xtr, ytr)
+def st_deviation_mv(x: np.ndarray, peaks: np.ndarray, fs: float) -> float:
+    if peaks.size == 0:
+        return 0.0
+    vals = []
+    j_offset = int(0.06 * fs)
+    pre_pq_l = int(0.20 * fs)
+    pre_pq_r = int(0.08 * fs)
+    for p in peaks:
+        j = min(len(x) - 1, p + j_offset)
+        a = max(0, p - pre_pq_l)
+        b = max(0, p - pre_pq_r)
+        base = np.median(x[a:b]) if b > a else 0.0
+        vals.append(x[j] - base)
+    return float(np.nanmean(vals))
 
-        xgb_cv = XGBClassifier(
-            n_estimators=400, max_depth=6, learning_rate=0.035,
-            subsample=0.8, colsample_bytree=0.8, max_delta_step=1,
-            tree_method='hist', eval_metric='logloss',
-            random_state=42, use_label_encoder=False, scale_pos_weight=1.0
-        ).fit(Xtr_res, ytr_res)
+def t_wave_amp(x: np.ndarray, peaks: np.ndarray, fs: float) -> float:
+    if peaks.size == 0:
+        return 0.0
+    amps = []
+    for p in peaks:
+        l = p + int(0.20 * fs)
+        r = min(len(x), p + int(0.40 * fs))
+        if r > l:
+            amps.append(np.max(x[l:r]) - np.median(x[max(0, p - int(0.1 * fs)):p]))
+    return float(np.nanmean(amps) if amps else 0.0)
 
-        rf_cv = RandomForestClassifier(
-            n_estimators=600, max_depth=None, n_jobs=-1,
-            class_weight=None, random_state=42
-        ).fit(Xtr_res, ytr_res)
+def rs_ratio(x: np.ndarray, peaks: np.ndarray, fs: float) -> float:
+    if peaks.size == 0:
+        return 0.0
+    ratios = []
+    for p in peaks:
+        l, r = beat_seg(x, p, fs)
+        seg = x[l:r]
+        if seg.size < 3:
+            continue
+        rp = int(np.argmax(seg))
+        s_min = np.min(seg[rp:]) if seg.size - rp > 1 else seg[rp]
+        r_amp = seg[rp] - np.median(seg[: max(1, rp)])
+        s_amp = np.median(seg[: max(1, rp)]) - s_min
+        if s_amp != 0:
+            ratios.append(r_amp / s_amp)
+    return float(np.nanmean(ratios) if ratios else 0.0)
 
-        oof_xgb[va] = xgb_cv.predict_proba(Xva)[:, 1]
-        oof_rf[va] = rf_cv.predict_proba(Xva)[:, 1]
+def psd_bandpowers(x: np.ndarray, fs: float, bands=((0.5, 5), (5, 15), (15, 40))) -> List[float]:
+    if x.size < 8:
+        return [0.0] * (len(bands) + 3)
+    f, Pxx = welch(x, fs=fs, nperseg=min(len(x), 256), noverlap=None)
+    total = np.trapz(Pxx, f) if Pxx.size else 0.0
+    feats = []
+    for lo, hi in bands:
+        m = (f >= lo) & (f < hi)
+        val = np.trapz(Pxx[m], f[m]) if np.any(m) else 0.0
+        feats.append(val)
+    if total > 0:
+        centroid = float(np.trapz(f * Pxx, f) / total)
+        pow_norm = Pxx / np.sum(Pxx)
+        flatness = float(entropy(pow_norm))
+        cdf = np.cumsum(pow_norm)
+        f_lo = f[np.searchsorted(cdf, 0.05)]
+        f_hi = f[min(len(f) - 1, np.searchsorted(cdf, 0.95))]
+        bandwidth = float(f_hi - f_lo)
+    else:
+        centroid = 0.0
+        flatness = 0.0
+        bandwidth = 0.0
+    feats += [centroid, bandwidth, flatness]
+    return feats
 
-    # Ensemble weight tuned on Challenge score using OOF probabilities
-    if verbose:
-        print('Searching ensemble weight on Challenge score...')
-    best_w, best_s = 0.5, -1.0
-    for w in np.linspace(0.1, 0.9, 17):
-        s = compute_challenge_score(y, w * oof_xgb + (1 - w) * oof_rf)
-        if s > best_s:
-            best_w, best_s = w, s
+def spec_summary(x: np.ndarray, fs: float) -> Tuple[float, float, float]:
+    if x.size < 32:
+        return 0.0, 0.0, 0.0
+    nseg = min(len(x), 256)
+    f, t, Sxx = spectrogram(x, fs=fs, nperseg=nseg, noverlap=nseg//2)
+    mask = f <= 40.0
+    f = f[mask]
+    P = np.nan_to_num(Sxx[mask].mean(axis=1))
+    tot = P.sum()
+    if tot <= 0:
+        return 0.0, 0.0, 0.0
+    centroid = float(np.sum(f * P) / tot)
+    pnorm = P / tot
+    flat = float(entropy(pnorm))
+    rolloff = f[np.searchsorted(np.cumsum(pnorm), 0.85)] if np.any(pnorm) else 0.0
+    return centroid, flat, float(rolloff)
 
-    # Calibrator learned on OOF ensemble scores
-    with warnings.catch_warnings():
-        warnings.simplefilter('ignore')
-        calibrator = IsotonicRegression(out_of_bounds='clip').fit(
-            best_w * oof_xgb + (1 - best_w) * oof_rf, y
-        )
+def zero_cross_rate(x: np.ndarray) -> float:
+    if x.size <= 1:
+        return 0.0
+    return float(np.mean(np.diff(np.sign(x)) != 0))
 
-    # ----- Final training on full data (single imbalance strategy: SMOTE only) -----
-    if verbose:
-        print('Training final models on full data...')
-    X_res, y_res = SMOTE(random_state=42).fit_resample(X_all, y)
+def axis_from_I_II(lead_I: np.ndarray, lead_II: np.ndarray, peaks: np.ndarray, fs: float) -> Tuple[float, float, float]:
+    if peaks.size == 0:
+        return 0.0, 0.0, 0.0
+    rI, rII = [], []
+    for p in peaks:
+        l, r = beat_seg(lead_I, p, fs)
+        segI = lead_I[l:r]
+        l2, r2 = beat_seg(lead_II, p, fs)
+        segII = lead_II[l2:r2]
+        if segI.size and segII.size:
+            rI.append(np.max(segI) - np.median(segI[: max(1, len(segI)//4)]))
+            rII.append(np.max(segII) - np.median(segII[: max(1, len(segII)//4)]))
+    if not rI or not rII:
+        return 0.0, 0.0, 0.0
+    RI = float(np.nanmean(rI))
+    RII = float(np.nanmean(rII))
+    angle = float(np.degrees(np.arctan2(RII, RI)))
+    return angle, float(np.sin(np.radians(angle))), float(np.cos(np.radians(angle)))
 
-    xgb = XGBClassifier(
-        n_estimators=400, max_depth=6, learning_rate=0.035,
-        subsample=0.8, colsample_bytree=0.8, max_delta_step=1,
-        tree_method='hist', eval_metric='logloss',
-        random_state=42, use_label_encoder=False, scale_pos_weight=1.0
-    ).fit(X_res, y_res)
-
-    rf = RandomForestClassifier(
-        n_estimators=600, max_depth=None, n_jobs=-1,
-        class_weight=None, random_state=42
-    ).fit(X_res, y_res)
-
-    # Threshold only for binary reporting; probabilities are calibrated
-    p_train_raw = best_w * xgb.predict_proba(X_all)[:, 1] + (1 - best_w) * rf.predict_proba(X_all)[:, 1]
-    p_train = calibrator.predict(p_train_raw)
-    threshold = optimize_threshold(p_train, y)
-
-    os.makedirs(model_folder, exist_ok=True)
-    save_model(model_folder, {
-        'xgb': xgb,
-        'rf': rf,
-        'scaler': scaler,
-        'calibrator': calibrator,
-        'w_ens': float(best_w),
-        'threshold': float(threshold)
-    })
-
-    if verbose:
-        print(f'Ensemble weight: {best_w:.3f} | Calibrated F1-optimal threshold: {threshold:.3f}')
-
-
-# ---------- Inference ----------
-def run_model(record, model, verbose):
-    x = extract_features(record).reshape(1, -1)
-    x = model['scaler'].transform(x)
-    px = float(model['xgb'].predict_proba(x)[0][1])
-    pr = float(model['rf'].predict_proba(x)[0][1])
-    p_raw = model.get('w_ens', 0.5) * px + (1 - model.get('w_ens', 0.5)) * pr
-    calibrator = model.get('calibrator', _Identity())
-    p = float(calibrator.predict([p_raw])[0])
-    return int(p >= model['threshold']), p
-
-
-class _Identity:
-    def predict(self, x):
-        return np.asarray(x, dtype=float)
-
-
-# ---------- Feature extraction ----------
-def extract_features(record):
+# =========================================================
+# 메인 피처 함수(100+ 차원)
+# =========================================================
+def extract_features(record: str) -> np.ndarray:
     header = load_header(record)
     signal, fields = load_signals(record)
-    fs = fields['fs']
+    fs = float(fields["fs"])
 
-    leads = get_signal_names(header)
-    idx = {name: i for i, name in enumerate(leads)}
+    lead_names = get_signal_names(header)
+    lead_idx = {name: i for i, name in enumerate(lead_names)}
 
-    def get_lead(name):
-        if name in idx:
-            return signal[:, idx[name]].astype(np.float64, copy=False)
-        return np.zeros(signal.shape[0], dtype=np.float64)
+    def get(name: str) -> np.ndarray:
+        if name in lead_idx:
+            return signal[:, lead_idx[name]].astype(np.float32, copy=False)
+        return signal[:, 0].astype(np.float32, copy=False)
 
-    def bp(x, low=0.5, high=40.0, order=2):
-        nyq = 0.5 * fs
-        b, a = butter(order, [low / nyq, high / nyq], btype='band')
-        pad = 3 * max(len(a), len(b))
-        if len(x) <= pad:
-            return x.copy()
-        return filtfilt(b, a, x)
+    leads = {
+        "I": get("I"), "II": get("II"),
+        "V1": get("V1"), "V2": get("V2"), "V3": get("V3"),
+        "V4": get("V4"), "V5": get("V5"), "V6": get("V6"),
+    }
+    for k in leads:
+        leads[k] = bandpass_filter(leads[k], fs, 0.5, 40.0, order=2)
 
-    def qrs_candidates(x):
-        f = bp(x)
-        d = np.diff(f)
-        if d.size == 0:
-            return np.array([], dtype=int)
-        s = d * d
-        w = max(1, int(0.150 * fs))
-        integ = np.convolve(s, np.ones(w) / w, mode='same')
-        init = integ[:min(len(integ), int(2 * fs))]
-        if init.size == 0:
-            return np.array([], dtype=int)
-        sig, noi = 0.25 * np.max(init), 0.5 * np.mean(init)
-        k = 0.25
-        peaks, last = [], -np.inf
-        min_rr = int(0.20 * fs)
-        for n, val in enumerate(integ):
-            thr = noi + k * (sig - noi)
-            if val > thr and (n - last) > min_rr:
-                L, R = max(n - int(0.05 * fs), 0), min(n + int(0.05 * fs), len(f) - 1)
-                if R > L and f[n] == np.max(f[L:R + 1]):
-                    peaks.append(n); last = n
-                    sig = 0.125 * val + 0.875 * sig
-            else:
-                noi = 0.125 * val + 0.875 * noi
-            if len(peaks) > 2:
-                rr_avg = np.mean(np.diff(peaks[-8:])) if len(peaks) >= 3 else np.diff(peaks[-2:])[0]
-                if (n - last) > 1.66 * rr_avg:
-                    thr *= 0.5
-        return np.asarray(peaks, dtype=int)
+    peaks = robust_rpeaks(leads, fs)
+    rr = np.diff(peaks) / fs if peaks.size >= 2 else np.array([], dtype=float)
+    mean_rr = float(np.nanmean(rr)) if rr.size else 0.0
+    heart_rate = float(60.0 / mean_rr) if mean_rr > 0 else 0.0
+    sdnn = float(np.nanstd(rr)) if rr.size else 0.0
+    diff_rr = np.diff(rr) if rr.size >= 2 else np.array([], dtype=float)
+    rmssd = float(np.sqrt(np.nanmean(diff_rr**2))) if diff_rr.size else 0.0
+    pnn50 = float(np.mean(np.abs(diff_rr) > 0.05)) if diff_rr.size else 0.0
+    rr_sk = float(skew(rr)) if rr.size >= 3 else 0.0
+    rr_ku = float(kurtosis(rr)) if rr.size >= 4 else 0.0
 
-    def merge(peak_lists, tol_ms=40):
-        arrs = [p for p in peak_lists if p.size > 0]
-        allp = np.sort(np.concatenate(arrs)) if arrs else np.array([], dtype=int)
-        if allp.size == 0:
-            return allp
-        tol = int(tol_ms * fs / 1000.0)
-        merged = [allp[0]]
-        for p in allp[1:]:
-            if p - merged[-1] <= tol:
-                merged[-1] = int((merged[-1] + p) * 0.5)
-            else:
-                merged.append(p)
-        return np.asarray(merged, dtype=int)
+    qrs_v1 = qrs_width_ms(leads["V1"], peaks, fs)
+    qrs_v2 = qrs_width_ms(leads["V2"], peaks, fs)
+    rsr_v1 = rsr_fragmentation_count(leads["V1"], peaks, fs)
+    rsr_v2 = rsr_fragmentation_count(leads["V2"], peaks, fs)
+    st_v2 = st_deviation_mv(leads["V2"], peaks, fs)
+    st_v5 = st_deviation_mv(leads["V5"], peaks, fs)
+    t_v3 = t_wave_amp(leads["V3"], peaks, fs)
+    t_v4 = t_wave_amp(leads["V4"], peaks, fs)
+    rs_ratio_v1 = rs_ratio(leads["V1"], peaks, fs)
+    rs_ratio_v2 = rs_ratio(leads["V2"], peaks, fs)
 
-    def safe_pct(x, q, default=0.0):
-        x = np.asarray(x)
-        if x.size == 0 or not np.any(np.isfinite(x)):
-            return default
-        return float(np.percentile(x, q))
+    axis_deg, axis_sin, axis_cos = axis_from_I_II(leads["I"], leads["II"], peaks, fs)
 
-    def spectral_feats(x):
-        if len(x) < 64:
-            return 0.0, 0.0, 0.0
-        f, Pxx = welch(x, fs=fs, nperseg=min(256, len(x)))
-        m = f <= 40.0
-        f, Pxx = f[m], Pxx[m]
-        tot = float(np.sum(Pxx))
-        if tot <= 0:
-            return 0.0, 0.0, 0.0
-        lf = float(np.sum(Pxx[(f >= 0) & (f < 15)]))
-        hf = float(np.sum(Pxx[(f >= 15) & (f <= 40)]))
-        lf_hf = float(lf / hf) if hf > 0 else 0.0
-        centroid = float(np.sum(f * Pxx) / tot)
-        flat = float(entropy(Pxx / tot))
-        return lf_hf, centroid, flat
+    # PSD 요약(8리드 × 6 = 48)
+    psd_feats = []
+    for nm in ["I", "II", "V1", "V2", "V3", "V4", "V5", "V6"]:
+        psd_feats += psd_bandpowers(leads[nm], fs)
 
-    def wavelet_ent(x):
-        x = np.asarray(x)
-        if x.size < 32:
-            return 0.0
-        try:
-            max_lvl = pywt.dwt_max_level(len(x), pywt.Wavelet('db4').dec_len)
-            lvl = min(4, max(1, max_lvl))
-            coeffs = pywt.wavedec(x, 'db4', level=lvl)
-            e = np.array([np.sum(c ** 2) for c in coeffs], dtype=np.float64)
-            tot = e.sum()
-            if tot <= 0:
-                return 0.0
-            p = e / tot
-            return float(entropy(p))
-        except Exception:
-            return 0.0
+    # 스펙트로그램 요약(II, V2, V6 × 3 = 9)
+    spec_feats = []
+    for nm in ["II", "V2", "V6"]:
+        c, fl, ro = spec_summary(leads[nm], fs)
+        spec_feats += [c, fl, ro]
 
-    def cwt_feats(x):
-        x = np.asarray(x)
-        if x.size < 64:
-            return 0.0, 0.0, 0.0
-        widths = np.arange(1, 16)
-        try:
-            cwt_matrix, _ = pywt.cwt(x, widths, 'morl', sampling_period=1 / fs)
-            power = np.abs(cwt_matrix) ** 2
-            return float(np.sum(power)), float(np.mean(power)), float(np.max(power))
-        except Exception:
-            return 0.0, 0.0, 0.0
+    # ZCR(8)
+    zcrs = [zero_cross_rate(leads[nm]) for nm in ["I","II","V1","V2","V3","V4","V5","V6"]]
 
-    # Leads
-    v1 = get_lead('V1'); v2 = get_lead('V2'); v3 = get_lead('V3')
-    v4 = get_lead('V4'); v5 = get_lead('V5'); v6 = get_lead('V6')
-    ii = get_lead('II'); i_lead = get_lead('I')
-
-    # Multi-lead R-peak consensus
-    peaks = merge([qrs_candidates(ii), qrs_candidates(v2), qrs_candidates(v5)], tol_ms=40)
-
-    # RR statistics
-    rr = np.diff(peaks) / fs if peaks.size > 1 else np.array([])
-    hr = float(60.0 / np.nanmean(rr)) if rr.size > 0 and np.nanmean(rr) > 0 else 0.0
-    rr_std = float(np.nanstd(rr)) if rr.size > 1 else 0.0
-    rr_sk = float(skew(rr)) if rr.size > 2 else 0.0
-    rr_ku = float(kurtosis(rr)) if rr.size > 3 else 0.0
-
-    # QRS duration (robust, median across beats)
-    def qrs_duration_ms(x, r_peaks):
-        if r_peaks.size < 2:
-            return 0.0
-        xb = bp(x, low=5.0, high=25.0, order=2)
-        widths_ms = []
-        win = int(0.08 * fs)
-        for r in r_peaks:
-            L, R = max(r - win, 0), min(r + win, len(xb) - 1)
-            seg = xb[L:R]
-            if seg.size < 3:
-                continue
-            d = np.abs(np.diff(seg))
-            thr = np.percentile(d, 75)
-            idx = np.where(d > thr)[0]
-            if idx.size > 0:
-                left = L + idx[0]
-                right = L + idx[-1]
-                widths_ms.append((right - left) / fs * 1000.0)
-        return float(np.median(widths_ms)) if widths_ms else 0.0
-
-    qrs_dur = qrs_duration_ms(v2 if np.any(v2) else ii, peaks)
-
-    # QT, T amplitude, symmetry, Q duration
-    qt, tamp, q_dur, t_sym = 0.0, 0.0, 0.0, 0.0
-    n_beats = max(1, peaks.size)
-    for p in peaks:
-        right = min(p + int(0.40 * fs), len(v3))
-        if right <= p:
-            continue
-        seg = v3[p:right]
-        t_pk, _ = find_peaks(seg, height=safe_pct(seg, 85, default=(np.max(seg) * 0.85 if seg.size else 0.0)))
-        if t_pk.size:
-            qt += (t_pk[-1] / fs) * 1000.0
-
-        seg2 = v4[p:right]
-        base = float(np.median(v4[max(p - 50, 0):p])) if p > 0 else 0.0
-        t_pk2, _ = find_peaks(seg2, height=safe_pct(seg2, 85, default=(np.max(seg2) * 0.85 if seg2.size else 0.0)))
-        if t_pk2.size:
-            tamp += float(seg2[t_pk2[-1]] - base)
-            half = t_pk2.size // 2
-            left_amp = float(np.mean(seg2[t_pk2[:half]])) if half > 0 else 0.0
-            right_amp = float(np.mean(seg2[t_pk2[half:]])) if half > 0 else 0.0
-            t_sym += abs(left_amp - right_amp)
-
-        seg_q = ii[max(p - int(0.25 * fs), 0):p]
-        neg = np.where(seg_q < 0)[0]
-        if neg.size > 1:
-            q_dur += (neg[-1] - neg[0]) / fs * 1000.0
-
-    qt /= n_beats
-    tamp /= n_beats
-    q_dur /= n_beats
-    t_sym /= n_beats
-
-    base_sig = v2 if np.any(v2) else ii
-    zcr = float(np.sum(np.diff(np.sign(base_sig)) != 0) / len(base_sig)) if len(base_sig) > 0 else 0.0
-
-    # RSR-like simple counts
-    def rsr_simple(xsig, r_peaks):
-        if r_peaks.size == 0:
-            return 0
-        f = bp(xsig, low=5, high=15, order=2)
-        d = np.diff(f)
-        cnt = 0
-        win = int(0.05 * fs)
-        for r in r_peaks:
-            L, R = max(r - win, 0), min(r + win, len(d))
-            seg = d[L:R]
-            if np.where(np.diff(np.sign(seg)))[0].size >= 3:
-                cnt += 1
-        return int(cnt)
-
-    rsr_v1 = rsr_simple(v1, peaks)
-    rsr_v2 = rsr_simple(v2, peaks)
-
-    # Spectral/Wavelet features
-    lf1, c1, f1 = spectral_feats(i_lead)
-    lf2, c2, f2 = spectral_feats(ii)
-    lf6, c6, f6 = spectral_feats(v6)
-
-    we_v2 = wavelet_ent(base_sig)
-    we_i = wavelet_ent(i_lead)
-
-    cwt_sum, cwt_mean, cwt_max = cwt_feats(base_sig)
-
-    # Global per-channel summaries
-    centroids, flatnesses = [], []
-    for ch in range(signal.shape[1]):
-        _, c, fl = spectral_feats(signal[:, ch])
-        centroids.append(c)
-        flatnesses.append(fl)
-
-    e2 = float(np.nansum(base_sig ** 2))
-    v2_var = float(np.nanvar(base_sig))
+    # 에너지(8) + 분산(8) + MAD(8)
+    energies = [float(np.nansum(leads[nm] ** 2)) for nm in ["I","II","V1","V2","V3","V4","V5","V6"]]
+    variances = [float(np.nanvar(leads[nm])) for nm in ["I","II","V1","V2","V3","V4","V5","V6"]]
+    mads = [float(np.nanmedian(np.abs(leads[nm] - np.nanmedian(leads[nm])))) for nm in ["I","II","V1","V2","V3","V4","V5","V6"]]
 
     feats = np.array([
-        hr, qrs_dur,
-        lf1, lf2, lf6,
-        rsr_v1, rsr_v2,
-        we_v2, we_i,
-        qt, tamp, q_dur,
-        e2, v2_var, zcr,
-        rr_std, rr_sk, rr_ku,
-        cwt_sum, cwt_mean, cwt_max,
-        *centroids, *flatnesses,
-        t_sym
+        # HRV(7)
+        heart_rate, mean_rr, sdnn, rmssd, pnn50, rr_sk, rr_ku,
+        # 형태학/단편화/ST/T/RS(10)
+        qrs_v1, qrs_v2, rsr_v1, rsr_v2, rs_ratio_v1, rs_ratio_v2, st_v2, st_v5, t_v3, t_v4,
+        # 전기축(3)
+        axis_deg, axis_sin, axis_cos,
+        # PSD(48)
+        *psd_feats,
+        # 스펙트로그램 요약(9)
+        *spec_feats,
+        # ZCR(8)
+        *zcrs,
+        # 에너지/분산/MAD(24)
+        *energies, *variances, *mads,
     ], dtype=np.float32)
 
-    return np.nan_to_num(feats, nan=0.0, posinf=0.0, neginf=0.0)
+    feats = np.nan_to_num(feats, nan=0.0, posinf=0.0, neginf=0.0)
+    return feats
+
+# =========================================================
+# 모델 빌더(고정 3종)
+# =========================================================
+def build_rf() -> RandomForestClassifier:
+    return RandomForestClassifier(
+        n_estimators=800,
+        max_depth=12,
+        min_samples_split=10,
+        min_samples_leaf=4,
+        max_features="sqrt",
+        class_weight="balanced_subsample",
+        n_jobs=-1,
+        random_state=RNG,
+    )
+
+def build_xgb(y: np.ndarray) -> XGBClassifier:
+    pos = max(1, int((y == 1).sum()))
+    neg = max(1, int((y == 0).sum()))
+    spw = neg / pos
+    return XGBClassifier(
+        n_estimators=400,
+        learning_rate=0.05,
+        max_depth=6,
+        min_child_weight=1,
+        subsample=1.0,
+        colsample_bytree=0.6,
+        gamma=0.0,
+        reg_alpha=0.0,
+        reg_lambda=0.5,
+        objective="binary:logistic",
+        eval_metric="logloss",
+        tree_method="hist",
+        scale_pos_weight=spw,
+        n_jobs=0,
+        random_state=RNG,
+        verbosity=0,
+    )
+
+def build_lr() -> LogisticRegression:
+    return LogisticRegression(
+        C=10.0,
+        penalty="l2",
+        solver="liblinear",
+        class_weight="balanced",
+        max_iter=2000,
+        random_state=RNG,
+    )
+
+def smote_fit_resample(X, y, seed):
+    if (y == 1).sum() < 2 or (y == 0).sum() < 2:
+        return X, y
+    try:
+        sm = SMOTE(random_state=seed)
+        return sm.fit_resample(X, y)
+    except Exception:
+        return X, y
+
+# =========================================================
+# 학습
+# =========================================================
+def train_model(data_folder: str, model_folder: str, verbose: bool):
+    if verbose:
+        print("Finding the Challenge data...")
+    records = find_records(data_folder)
+    if len(records) == 0:
+        raise FileNotFoundError("No data were provided.")
+
+    if verbose:
+        print("Extracting features and labels...")
+    feats, labels = [], []
+    for i, rec in enumerate(records, 1):
+        if verbose and (i % 200 == 0 or i == len(records)):
+            print(f"- {i}/{len(records)}: {rec}")
+        path = os.path.join(data_folder, rec)
+        f = extract_features(path)
+        if np.all(np.isfinite(f)):
+            feats.append(f)
+            labels.append(load_label(path))
+
+    X = np.vstack(feats).astype(np.float32)
+    y = np.asarray(labels, dtype=int)
+
+    if verbose:
+        print(f"Feature matrix: {X.shape}, Positives: {int(y.sum())}, Negatives: {int((y==0).sum())}")
+
+    scaler = StandardScaler()
+    Xs = scaler.fit_transform(X)
+
+    members: List[str] = ["rf", "xgb", "lr"]
+
+    # --------- OOF 확률 산출 ---------
+    if verbose:
+        print("Building OOF predictions for kind = rf+xgb+lr ...")
+    skf = StratifiedKFold(n_splits=10, shuffle=True, random_state=RNG)
+
+    oof = {m: np.zeros(len(y), dtype=float) for m in members}
+    fold_ids = np.full(len(y), -1, dtype=int)
+    for fold, (tr_idx, va_idx) in enumerate(skf.split(Xs, y), 1):
+        X_tr, y_tr = Xs[tr_idx], y[tr_idx]
+        X_va = Xs[va_idx]
+
+        X_tr_res, y_tr_res = smote_fit_resample(X_tr, y_tr, seed=RNG + fold)
+
+        rf = build_rf()
+        rf.fit(X_tr_res, y_tr_res)
+        oof["rf"][va_idx] = rf.predict_proba(X_va)[:, 1]
+
+        xgb = build_xgb(y_tr_res)
+        xgb.fit(X_tr_res, y_tr_res)
+        oof["xgb"][va_idx] = xgb.predict_proba(X_va)[:, 1]
+
+        lr = build_lr()
+        lr.fit(X_tr_res, y_tr_res)
+        oof["lr"][va_idx] = lr.predict_proba(X_va)[:, 1]
+
+        fold_ids[va_idx] = fold
+
+        if verbose:
+            f1_tmp = {m: f1_score(y[va_idx], (oof[m][va_idx] >= 0.5).astype(int)) for m in members}
+            msg = "  Fold {}: ".format(fold) + " ".join([f"{m} F1@0.5={f1_tmp[m]:.3f}" for m in members])
+            print(msg)
+
+    # --------- 앙상블 가중(OOF AUPRC 기반) ---------
+    weights = {m: 1.0 for m in members}
+    for m in members:
+        _, auprc_m = compute_auc(y, oof[m])
+        weights[m] = max(auprc_m, 1e-6)
+    s = sum(weights.values())
+    for m in members:
+        weights[m] /= s
+
+    # OOF 앙상블 확률
+    w = np.array([weights[m] for m in members], dtype=float)   # [3]
+    oof_stack = np.vstack([oof[m] for m in members])           # [3, N]
+    oof_ens = (w[:, None] * oof_stack).sum(axis=0)
+
+    # 임계값 산출
+    thr_f1 = optimize_threshold_f1(oof_ens, y)
+    thr_chal = optimize_threshold_top5(oof_ens)
+    if verbose:
+        print(f"Optimized thresholds -> F1: {thr_f1:.4f}, Top5%: {thr_chal:.6f}")
+
+    # --------- fold별 점수 계산(저장용) ---------
+    max_fold = int(fold_ids.max())
+    f1_per_fold, acc_per_fold, auroc_per_fold, auprc_per_fold, chal_per_fold = [], [], [], [], []
+    for k in range(1, max_fold + 1):
+        mask = (fold_ids == k)
+        y_k = y[mask]
+        p_k = oof_ens[mask]
+        if y_k.size == 0:
+            continue
+        yhat_k = (p_k >= thr_f1).astype(int)
+        f1_per_fold.append(compute_f_measure(y_k, yhat_k))
+        acc_per_fold.append(compute_accuracy(y_k, yhat_k))
+        auroc_k, auprc_k = compute_auc(y_k, p_k)
+        auroc_per_fold.append(auroc_k)
+        auprc_per_fold.append(auprc_k)
+        chal_per_fold.append(compute_challenge_score(y_k, p_k))
+
+    scores_dict = {
+        "f1": np.asarray(f1_per_fold, dtype=float),
+        "accuracy": np.asarray(acc_per_fold, dtype=float),
+        "auroc": np.asarray(auroc_per_fold, dtype=float),
+        "auprc": np.asarray(auprc_per_fold, dtype=float),
+        "challenge_score": np.asarray(chal_per_fold, dtype=float),
+    }
+
+    # --------- 최종 학습(전체 데이터) ---------
+    if verbose:
+        print("Fitting final models on all data ...")
+    X_res, y_res = smote_fit_resample(Xs, y, seed=RNG)
+    fitted: Dict[str, object] = {}
+
+    rf = build_rf()
+    rf.fit(X_res, y_res)
+    fitted["rf"] = rf
+
+    xgb = build_xgb(y_res)
+    xgb.fit(X_res, y_res)
+    fitted["xgb"] = xgb
+
+    lr = build_lr()
+    lr.fit(X_res, y_res)
+    fitted["lr"] = lr
+
+    os.makedirs(model_folder, exist_ok=True)
+    payload = {
+        "scaler": scaler,
+        "kind": "rf+xgb+lr",
+        "members": members,
+        "weights": weights,
+        "threshold_f1": float(thr_f1),
+        "threshold_challenge": float(thr_chal),
+        "models": fitted,
+        "feature_dim": int(X.shape[1]),
+        # ----- 재학습 없이 p-value 산출용 -----
+        "oof_label": y.astype(int),
+        "oof_proba": oof_ens.astype(float),
+        "fold_ids": fold_ids.astype(int),
+        "scores": scores_dict,
+    }
+    save_payload(model_folder, payload)
+    if verbose:
+        print("Training complete.")
+
+# =========================================================
+# 로드/추론
+# =========================================================
+def load_model(model_folder: str, verbose: bool):
+    return load_payload(model_folder, verbose=verbose)
+
+def _predict_proba(models: Dict[str, object], members: List[str], weights: Dict[str, float], X: np.ndarray) -> float:
+    total = 0.0
+    for m in members:
+        p = float(models[m].predict_proba(X)[0, 1])
+        total += weights[m] * p
+    return float(total)
+
+def run_model(record: str, model, verbose: bool):
+    f = extract_features(record).reshape(1, -1)
+    X = model["scaler"].transform(f)
+    proba = _predict_proba(model["models"], model["members"], model["weights"], X)
+    t = float(model.get("threshold_challenge", 0.5))
+    binary = int(proba >= t)
+    return binary, proba
