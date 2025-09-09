@@ -36,6 +36,48 @@ from scipy.stats import entropy, skew, kurtosis
 RNG = 42
 np.random.seed(RNG)
 
+# =========================
+# [ADD] 그룹→모델 전략(검증 반영)
+# =========================
+GROUP2MODEL = {
+    'HRV': 'rf',
+    'MORPH': 'rf',
+    'AXIS': 'lr',
+    'PSD': 'xgb',
+    'SPEC': 'rf',
+    'ZCR': 'xgb',
+    'EVM': 'xgb',
+}
+
+# =========================``
+# [ADD] 65개 제거 목록(고정)
+# =========================
+REMOVED_FEATURES_65 = {
+    "hr","pnn50","rr_skew",
+    "qrs_V1","rsr_V1","rsr_V2","st_V5","rs_ratio_V2",
+    "II_bp_15_40","V2_bp_0p5_5","V3_bp_5_15",
+    "V3_centroid","V5_centroid",
+    "V4_bandwidth","V5_bandwidth","V6_bandwidth",
+    "zcr_V2","zcr_V3","zcr_V4",
+    "mad_V2","mad_V5","mad_V6",
+    "mean_rr","rmssd","rr_kurt",
+    "axis_cos", "I_bp_15_40","I_centroid","I_flatness",
+    "II_centroid","II_flatness", "V1_bp_15_40","V1_centroid",
+    "V2_bp_5_15","V2_bp_15_40","V2_centroid", "V3_bp_0p5_5",
+    "V3_bp_15_40","V3_flatness", "V4_bp_0p5_5","V4_bp_5_15",
+    "V4_bp_15_40","V4_centroid", "V5_bp_0p5_5","V5_bp_15_40",
+    "V5_flatness", "V6_bp_15_40","V6_centroid","V6_flatness",
+    "II_spec_centroid","II_spec_flatness","V2_spec_flatness",
+    "II_spec_rolloff","V2_spec_rolloff","V6_spec_rolloff",
+    "zcr_V5","zcr_V6", "energy_V4","energy_V5", "var_V4",
+    "var_V5","var_V6", "mad_V1","mad_V3","mad_V4",
+}
+
+# =========================
+# [ADD] 공통 리드 목록
+# =========================
+LEADS8 = ["I","II","V1","V2","V3","V4","V5","V6"]
+
 # =========================================================
 # 저장/로드 유틸
 # =========================================================
@@ -370,7 +412,50 @@ def axis_from_I_II(lead_I: np.ndarray, lead_II: np.ndarray, peaks: np.ndarray, f
     return angle, float(np.sin(np.radians(angle))), float(np.cos(np.radians(angle)))
 
 # =========================================================
-# 메인 피처 함수(100+ 차원)
+# [ADD/REPLACE] 피처 카탈로그 & 모델별 인덱스 빌더
+# =========================================================
+def _feature_catalog_after_removal():
+    # 109 원천 이름 생성
+    HRV = ["hr","mean_rr","sdnn","rmssd","pnn50","rr_skew","rr_kurt"]
+    MORPH = ["qrs_V1","qrs_V2","rsr_V1","rsr_V2","rs_ratio_V1","rs_ratio_V2","st_V2","st_V5","t_V3","t_V4"]
+    AXIS = ["axis_deg","axis_sin","axis_cos"]
+    psd_tags = ["bp_0p5_5","bp_5_15","bp_15_40","centroid","bandwidth","flatness"]
+    PSD = [f"{L}_{t}" for L in LEADS8 for t in psd_tags]
+    SPEC = [f"{L}_spec_centroid" for L in ["II","V2","V6"]] + \
+           [f"{L}_spec_flatness" for L in ["II","V2","V6"]] + \
+           [f"{L}_spec_rolloff"  for L in ["II","V2","V6"]]
+    ZCR = [f"zcr_{L}" for L in LEADS8]
+    E   = [f"energy_{L}" for L in LEADS8]
+    V   = [f"var_{L}"    for L in LEADS8]
+    MAD = [f"mad_{L}"    for L in LEADS8]
+
+    names_all = HRV + MORPH + AXIS + PSD + SPEC + ZCR + E + V + MAD
+    names = [n for n in names_all if n not in REMOVED_FEATURES_65]
+
+    groups = {
+        "HRV":   [n for n in HRV   if n in names],
+        "MORPH": [n for n in MORPH if n in names],
+        "AXIS":  [n for n in AXIS  if n in names],
+        "PSD":   [n for n in PSD   if n in names],
+        "SPEC":  [n for n in SPEC  if n in names],
+        "ZCR":   [n for n in ZCR   if n in names],
+        "EVM":   [n for n in (E+V+MAD) if n in names],
+    }
+    return names, groups
+
+def _member_feature_indices():
+    names, groups = _feature_catalog_after_removal()
+    idx = {n:i for i,n in enumerate(names)}
+    member_groups = {'rf':[], 'xgb':[], 'lr':[]}
+    for g, m in GROUP2MODEL.items():
+        member_groups[m].extend(groups[g])
+    member_idx = {m: sorted(idx[n] for n in ns) for m, ns in member_groups.items()}
+    # 안전장치: 모든 피처가 정확히 한 모델에만 할당되어야 함
+    assert sum(len(v) for v in member_idx.values()) == len(names)
+    return names, groups, member_idx
+
+# =========================================================
+# 메인 피처 함수(109→87 차원: 22개 제거 반영)
 # =========================================================
 def extract_features(record: str) -> np.ndarray:
     header = load_header(record)
@@ -385,11 +470,7 @@ def extract_features(record: str) -> np.ndarray:
             return signal[:, lead_idx[name]].astype(np.float32, copy=False)
         return signal[:, 0].astype(np.float32, copy=False)
 
-    leads = {
-        "I": get("I"), "II": get("II"),
-        "V1": get("V1"), "V2": get("V2"), "V3": get("V3"),
-        "V4": get("V4"), "V5": get("V5"), "V6": get("V6"),
-    }
+    leads = {L: get(L) for L in LEADS8}
     for k in leads:
         leads[k] = bandpass_filter(leads[k], fs, 0.5, 40.0, order=2)
 
@@ -417,42 +498,61 @@ def extract_features(record: str) -> np.ndarray:
 
     axis_deg, axis_sin, axis_cos = axis_from_I_II(leads["I"], leads["II"], peaks, fs)
 
-    # PSD 요약(8리드 × 6 = 48)
-    psd_feats = []
-    for nm in ["I", "II", "V1", "V2", "V3", "V4", "V5", "V6"]:
-        psd_feats += psd_bandpowers(leads[nm], fs)
+    # PSD(8×6=48)
+    psd_vals = []
+    for nm in LEADS8:
+        psd_vals += psd_bandpowers(leads[nm], fs)
 
-    # 스펙트로그램 요약(II, V2, V6 × 3 = 9)
-    spec_feats = []
-    for nm in ["II", "V2", "V6"]:
+    # SPEC(II,V2,V6 ×3=9)
+    spec_vals = []
+    for nm in ["II","V2","V6"]:
         c, fl, ro = spec_summary(leads[nm], fs)
-        spec_feats += [c, fl, ro]
+        spec_vals += [c, fl, ro]
 
     # ZCR(8)
-    zcrs = [zero_cross_rate(leads[nm]) for nm in ["I","II","V1","V2","V3","V4","V5","V6"]]
+    zcr_vals = [zero_cross_rate(leads[nm]) for nm in LEADS8]
 
-    # 에너지(8) + 분산(8) + MAD(8)
-    energies = [float(np.nansum(leads[nm] ** 2)) for nm in ["I","II","V1","V2","V3","V4","V5","V6"]]
-    variances = [float(np.nanvar(leads[nm])) for nm in ["I","II","V1","V2","V3","V4","V5","V6"]]
-    mads = [float(np.nanmedian(np.abs(leads[nm] - np.nanmedian(leads[nm])))) for nm in ["I","II","V1","V2","V3","V4","V5","V6"]]
+    # E/V/MAD(8×3=24)
+    energies  = [float(np.nansum(leads[nm] ** 2)) for nm in LEADS8]
+    variances = [float(np.nanvar(leads[nm]))        for nm in LEADS8]
+    mads      = [float(np.nanmedian(np.abs(leads[nm] - np.nanmedian(leads[nm])))) for nm in LEADS8]
 
-    feats = np.array([
+    # 109 이름/값
+    HRVn = ["hr","mean_rr","sdnn","rmssd","pnn50","rr_skew","rr_kurt"]
+    MORn = ["qrs_V1","qrs_V2","rsr_V1","rsr_V2","rs_ratio_V1","rs_ratio_V2","st_V2","st_V5","t_V3","t_V4"]
+    AXIn = ["axis_deg","axis_sin","axis_cos"]
+    psd_tags = ["bp_0p5_5","bp_5_15","bp_15_40","centroid","bandwidth","flatness"]
+    PSDn = [f"{L}_{t}" for L in LEADS8 for t in psd_tags]
+    SPECn = [f"{L}_spec_centroid" for L in ["II","V2","V6"]] + \
+            [f"{L}_spec_flatness" for L in ["II","V2","V6"]] + \
+            [f"{L}_spec_rolloff"  for L in ["II","V2","V6"]]
+    ZCRn = [f"zcr_{L}" for L in LEADS8]
+    En   = [f"energy_{L}" for L in LEADS8]
+    Vn   = [f"var_{L}"    for L in LEADS8]
+    MADn = [f"mad_{L}"    for L in LEADS8]
+
+    names_109 = HRVn + MORn + AXIn + PSDn + SPECn + ZCRn + En + Vn + MADn
+    values_all = [
         # HRV(7)
         heart_rate, mean_rr, sdnn, rmssd, pnn50, rr_sk, rr_ku,
-        # 형태학/단편화/ST/T/RS(10)
+        # MORPH(10)
         qrs_v1, qrs_v2, rsr_v1, rsr_v2, rs_ratio_v1, rs_ratio_v2, st_v2, st_v5, t_v3, t_v4,
-        # 전기축(3)
+        # AXIS(3)
         axis_deg, axis_sin, axis_cos,
         # PSD(48)
-        *psd_feats,
-        # 스펙트로그램 요약(9)
-        *spec_feats,
+        *psd_vals,
+        # SPEC(9)
+        *spec_vals,
         # ZCR(8)
-        *zcrs,
-        # 에너지/분산/MAD(24)
+        *zcr_vals,
+        # E/V/MAD(24)
         *energies, *variances, *mads,
-    ], dtype=np.float32)
+    ]
+    assert len(names_109) == len(values_all)
 
+    # 제거 반영 → 87
+    kept_vals = [val for nm, val in zip(names_109, values_all) if nm not in REMOVED_FEATURES_65]
+    feats = np.array(kept_vals, dtype=np.float32)
     feats = np.nan_to_num(feats, nan=0.0, posinf=0.0, neginf=0.0)
     return feats
 
@@ -535,48 +635,54 @@ def train_model(data_folder: str, model_folder: str, verbose: bool):
             feats.append(f)
             labels.append(load_label(path))
 
-    X = np.vstack(feats).astype(np.float32)
+    X = np.vstack(feats).astype(np.float32)   # [N,87]
     y = np.asarray(labels, dtype=int)
 
     if verbose:
         print(f"Feature matrix: {X.shape}, Positives: {int(y.sum())}, Negatives: {int((y==0).sum())}")
 
+    # 표준화(전체 87 기준)
     scaler = StandardScaler()
     Xs = scaler.fit_transform(X)
 
+    # [ADD] 전략 기반 피처 인덱스
+    feat_names, groups, member_idx = _member_feature_indices()
     members: List[str] = ["rf", "xgb", "lr"]
 
-    # --------- OOF 확률 산출 ---------
+    # --------- OOF ---------
     if verbose:
-        print("Building OOF predictions for kind = rf+xgb+lr ...")
+        print("Building OOF predictions with group-wise feature assignment ...")
     skf = StratifiedKFold(n_splits=10, shuffle=True, random_state=RNG)
-
     oof = {m: np.zeros(len(y), dtype=float) for m in members}
     fold_ids = np.full(len(y), -1, dtype=int)
+
     for fold, (tr_idx, va_idx) in enumerate(skf.split(Xs, y), 1):
         X_tr, y_tr = Xs[tr_idx], y[tr_idx]
         X_va = Xs[va_idx]
 
-        X_tr_res, y_tr_res = smote_fit_resample(X_tr, y_tr, seed=RNG + fold)
-
+        # RF
         rf = build_rf()
-        rf.fit(X_tr_res, y_tr_res)
-        oof["rf"][va_idx] = rf.predict_proba(X_va)[:, 1]
+        Xtr_rf, ytr_rf = smote_fit_resample(X_tr[:, member_idx["rf"]], y_tr, seed=RNG + fold)
+        rf.fit(Xtr_rf, ytr_rf)
+        oof["rf"][va_idx] = rf.predict_proba(X_va[:, member_idx["rf"]])[:, 1]
 
-        xgb = build_xgb(y_tr_res)
-        xgb.fit(X_tr_res, y_tr_res)
-        oof["xgb"][va_idx] = xgb.predict_proba(X_va)[:, 1]
+        # XGB
+        xgb = build_xgb(y_tr)
+        Xtr_xgb, ytr_xgb = smote_fit_resample(X_tr[:, member_idx["xgb"]], y_tr, seed=RNG + fold)
+        xgb.fit(Xtr_xgb, ytr_xgb)
+        oof["xgb"][va_idx] = xgb.predict_proba(X_va[:, member_idx["xgb"]])[:, 1]
 
+        # LR
         lr = build_lr()
-        lr.fit(X_tr_res, y_tr_res)
-        oof["lr"][va_idx] = lr.predict_proba(X_va)[:, 1]
+        Xtr_lr, ytr_lr = smote_fit_resample(X_tr[:, member_idx["lr"]], y_tr, seed=RNG + fold)
+        lr.fit(Xtr_lr, ytr_lr)
+        oof["lr"][va_idx] = lr.predict_proba(X_va[:, member_idx["lr"]])[:, 1]
 
         fold_ids[va_idx] = fold
 
         if verbose:
             f1_tmp = {m: f1_score(y[va_idx], (oof[m][va_idx] >= 0.5).astype(int)) for m in members}
-            msg = "  Fold {}: ".format(fold) + " ".join([f"{m} F1@0.5={f1_tmp[m]:.3f}" for m in members])
-            print(msg)
+            print("  Fold {}: ".format(fold) + " ".join([f"{m} F1@0.5={f1_tmp[m]:.3f}" for m in members]))
 
     # --------- 앙상블 가중(OOF AUPRC 기반) ---------
     weights = {m: 1.0 for m in members}
@@ -625,21 +731,18 @@ def train_model(data_folder: str, model_folder: str, verbose: bool):
 
     # --------- 최종 학습(전체 데이터) ---------
     if verbose:
-        print("Fitting final models on all data ...")
-    X_res, y_res = smote_fit_resample(Xs, y, seed=RNG)
+        print("Fitting final models on all data with group-wise features ...")
     fitted: Dict[str, object] = {}
 
-    rf = build_rf()
-    rf.fit(X_res, y_res)
-    fitted["rf"] = rf
-
-    xgb = build_xgb(y_res)
-    xgb.fit(X_res, y_res)
-    fitted["xgb"] = xgb
-
-    lr = build_lr()
-    lr.fit(X_res, y_res)
-    fitted["lr"] = lr
+    # RF
+    Xrf, yrf = smote_fit_resample(Xs[:, member_idx["rf"]], y, seed=RNG)
+    rf = build_rf(); rf.fit(Xrf, yrf); fitted["rf"] = rf
+    # XGB
+    Xx, yx = smote_fit_resample(Xs[:, member_idx["xgb"]], y, seed=RNG)
+    xgb = build_xgb(yx); xgb.fit(Xx, yx); fitted["xgb"] = xgb
+    # LR
+    Xl, yl = smote_fit_resample(Xs[:, member_idx["lr"]], y, seed=RNG)
+    lr = build_lr(); lr.fit(Xl, yl); fitted["lr"] = lr
 
     os.makedirs(model_folder, exist_ok=True)
     payload = {
@@ -650,7 +753,12 @@ def train_model(data_folder: str, model_folder: str, verbose: bool):
         "threshold_f1": float(thr_f1),
         "threshold_challenge": float(thr_chal),
         "models": fitted,
-        "feature_dim": int(X.shape[1]),
+        "feature_dim": int(X.shape[1]),  # 87
+        # [ADD] 메타 저장
+        "feature_names": feat_names,
+        "groups": groups,
+        "member_feature_indices": member_idx,
+        "group2model": GROUP2MODEL,
         # ----- 재학습 없이 p-value 산출용 -----
         "oof_label": y.astype(int),
         "oof_proba": oof_ens.astype(float),
@@ -667,17 +775,22 @@ def train_model(data_folder: str, model_folder: str, verbose: bool):
 def load_model(model_folder: str, verbose: bool):
     return load_payload(model_folder, verbose=verbose)
 
-def _predict_proba(models: Dict[str, object], members: List[str], weights: Dict[str, float], X: np.ndarray) -> float:
+# =========================
+# [MOD] 예측시 모델별 피처 서브셋 사용
+# =========================
+def _predict_proba(models: Dict[str, object], members: List[str], weights: Dict[str, float],
+                   X: np.ndarray, member_idx: Dict[str, List[int]]) -> float:
     total = 0.0
     for m in members:
-        p = float(models[m].predict_proba(X)[0, 1])
+        cols = member_idx[m]
+        p = float(models[m].predict_proba(X[:, cols])[:, 1])
         total += weights[m] * p
     return float(total)
 
 def run_model(record: str, model, verbose: bool):
     f = extract_features(record).reshape(1, -1)
     X = model["scaler"].transform(f)
-    proba = _predict_proba(model["models"], model["members"], model["weights"], X)
-    t = float(model.get("threshold_challenge", 0.5))
+    proba = _predict_proba(model["models"], model["members"], model["weights"], X, model["member_feature_indices"])
+    t = float(model.get("threshold_f1", 0.5))
     binary = int(proba >= t)
     return binary, proba
